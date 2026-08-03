@@ -1,0 +1,115 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1200" height="300" viewBox="0 0 1200 300" preserveAspectRatio="xMidYMid meet" role="img" aria-labelledby="bannerTitle bannerDesc">
+  <title id="bannerTitle">secureRAGapp</title>
+  <desc id="bannerDesc">A retrieval-augmented generation pipeline: auth, validate, filter, retrieve, generate, output. Two injection attempts are shown being blocked — one at the query filter, one at the output filter after entering through a retrieved document.</desc>
+
+  <defs>
+    <linearGradient id="bgGrad" x1="0" y1="0" x2="1" y2="1">
+      <stop offset="0%" stop-color="#0B0F17"/>
+      <stop offset="100%" stop-color="#05070A"/>
+    </linearGradient>
+    <pattern id="dots" width="28" height="28" patternUnits="userSpaceOnUse">
+      <circle cx="2" cy="2" r="1" fill="#1E293B" opacity="0.6"/>
+    </pattern>
+    <filter id="glow" x="-100%" y="-100%" width="300%" height="300%">
+      <feGaussianBlur stdDeviation="3.5" result="blur"/>
+      <feMerge>
+        <feMergeNode in="blur"/>
+        <feMergeNode in="SourceGraphic"/>
+      </feMerge>
+    </filter>
+  </defs>
+
+  <rect width="1200" height="300" fill="url(#bgGrad)"/>
+  <rect width="1200" height="300" fill="url(#dots)"/>
+  <rect x="0.5" y="0.5" width="1199" height="299" fill="none" stroke="#161B24" stroke-width="1"/>
+
+  <text x="60" y="96" font-family="'SF Mono','JetBrains Mono',Menlo,Consolas,monospace" font-size="44" font-weight="700" letter-spacing="1" fill="#EEF2F7">SECURE<tspan fill="#2DD4BF">&#183;</tspan>RAG</text>
+  <text x="62" y="124" font-family="-apple-system,BlinkMacSystemFont,'Segoe UI',sans-serif" font-size="14" letter-spacing="0.3" fill="#64748B">Retrieval-augmented pipeline &#183; built to be red-teamed</text>
+
+  <line x1="150" y1="205" x2="1050" y2="205" stroke="#1E293B" stroke-width="2"/>
+
+  <!-- AUTH -->
+  <circle cx="150" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.01;0.03;0.05;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="95" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="150" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">AUTH</text>
+
+  <!-- VALIDATE -->
+  <circle cx="330" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.184;0.204;0.224;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="275" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="330" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">VALIDATE</text>
+
+  <!-- FILTER -->
+  <circle cx="510" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.358;0.378;0.398;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="510" cy="205" r="34" fill="none" stroke="#F59E0B" stroke-width="2.5" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.95;0;0" keyTimes="0;0.43;0.45;0.47;1" dur="7s" begin="1s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="455" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="510" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">FILTER</text>
+  <text x="510" y="157" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="0.5" fill="#F59E0B" opacity="0">BLOCKED &#183; query injection
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.43;0.46;0.62;0.66" dur="7s" begin="1s" repeatCount="indefinite"/>
+  </text>
+
+  <!-- RETRIEVE -->
+  <circle cx="690" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.532;0.552;0.572;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="635" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="690" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">RETRIEVE</text>
+
+  <!-- GENERATE -->
+  <circle cx="870" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.706;0.726;0.746;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="815" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="870" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">GENERATE</text>
+
+  <!-- OUTPUT -->
+  <circle cx="1050" cy="205" r="26" fill="none" stroke="#2DD4BF" stroke-width="2" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.9;0;0" keyTimes="0;0.86;0.88;0.90;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+  <circle cx="1050" cy="205" r="34" fill="none" stroke="#F59E0B" stroke-width="2.5" opacity="0">
+    <animate attributeName="opacity" values="0;0;0.95;0;0" keyTimes="0;0.43;0.45;0.47;1" dur="7s" begin="4s" repeatCount="indefinite"/>
+  </circle>
+  <rect x="995" y="185" width="110" height="40" rx="6" fill="#0F172A" stroke="#334155" stroke-width="1.5"/>
+  <text x="1050" y="209" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="1" fill="#94A3B8">OUTPUT</text>
+  <text x="1050" y="157" text-anchor="middle" font-family="monospace" font-size="11" letter-spacing="0.5" fill="#F59E0B" opacity="0">BLOCKED &#183; doc-borne injection
+    <animate attributeName="opacity" values="0;0;1;1;0" keyTimes="0;0.43;0.46;0.62;0.66" dur="7s" begin="4s" repeatCount="indefinite"/>
+  </text>
+
+  <!-- legitimate query pulse -->
+  <circle r="6" cy="205" fill="#2DD4BF" filter="url(#glow)">
+    <animate attributeName="cx" values="150;150;1050;1050;150" keyTimes="0;0.03;0.9;0.95;1" dur="7s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.03;0.9;0.93;1" dur="7s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- hostile query, caught at the prompt filter -->
+  <circle r="6" cy="205" fill="#F59E0B" filter="url(#glow)">
+    <animate attributeName="cx" values="150;150;510;510;150" keyTimes="0;0.03;0.45;0.46;1" dur="7s" begin="1s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.03;0.44;0.46;1" dur="7s" begin="1s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- injection riding a retrieved document, caught at the output filter -->
+  <circle r="6" cy="205" fill="#F59E0B" filter="url(#glow)">
+    <animate attributeName="cx" values="690;690;1050;1050;690" keyTimes="0;0.03;0.45;0.46;1" dur="7s" begin="4s" repeatCount="indefinite"/>
+    <animate attributeName="opacity" values="0;1;1;0;0" keyTimes="0;0.03;0.44;0.46;1" dur="7s" begin="4s" repeatCount="indefinite"/>
+  </circle>
+
+  <!-- status ticker -->
+  <text x="62" y="270" font-family="monospace" font-size="13" fill="#2DD4BF" opacity="0">$ phase 0 &#8212; skeleton committed
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.30;0.35" dur="9s" begin="0s" repeatCount="indefinite"/>
+  </text>
+  <text x="62" y="270" font-family="monospace" font-size="13" fill="#2DD4BF" opacity="0">&gt; 10 modules &#183; 3 filter layers
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.30;0.35" dur="9s" begin="3s" repeatCount="indefinite"/>
+  </text>
+  <text x="62" y="270" font-family="monospace" font-size="13" fill="#2DD4BF" opacity="0">&gt; phase 1 implementation pending
+    <animate attributeName="opacity" values="0;1;1;0" keyTimes="0;0.05;0.30;0.35" dur="9s" begin="6s" repeatCount="indefinite"/>
+  </text>
+
+  <text x="1140" y="280" text-anchor="end" font-family="monospace" font-size="11" fill="#475569">// claude &#183; chroma</text>
+</svg>

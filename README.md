@@ -1,5 +1,7 @@
 # secureRAGapp
 
+![secureRAGapp](assets/banner.svg)
+
 A security-focused RAG application. Two phases: build it defensively, then
 red-team it and document the findings.
 

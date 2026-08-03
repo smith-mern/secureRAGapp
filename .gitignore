@@ -4,3 +4,8 @@ __pycache__/
 *.py[cod]
 audit.log
 .pytest_cache/
+
+# Generated at runtime. Contains embedded chunk text for every tier —
+# treat as sensitive, never commit.
+data/chroma_db/
+data/chroma_db/

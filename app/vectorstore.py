@@ -8,6 +8,6 @@ Every query is scoped to the caller's access rights — filtering happens in the
 query, not on the result set, so a caller never receives chunks they aren't
 entitled to.
 
-Backend not yet chosen (Chroma / pgvector / Qdrant); keep the surface small
-enough that swapping it stays a one-file change.
+Backend is Chroma in embedded/persistent mode (data/chroma_db/); keep the
+surface small enough that swapping it stays a one-file change.
 """

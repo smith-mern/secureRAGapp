@@ -2,8 +2,7 @@ fastapi
 uvicorn[standard]
 pydantic
 anthropic
+chromadb
 python-dotenv
 pytest
-
-# Vector store backend not chosen yet — add chromadb / pgvector / qdrant-client
-# when app/vectorstore.py picks one.
+httpx

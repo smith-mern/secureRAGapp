@@ -29,6 +29,16 @@ schema_config:
         prefix: index_
         period: 24h
 
+ingester:
+  wal:
+    # Disabled deliberately. The WAL exists to recover in-memory chunks after a
+    # crash, but audit.log is the source of truth here — recovery is "wipe
+    # observability/data and restart", which re-reads the file from the start.
+    # Leaving it on also makes Loki throttle writes and shut the ingester down
+    # whenever the disk crosses 90% full, which silently stops ingestion while
+    # the process stays alive and healthy-looking.
+    enabled: false
+
 limits_config:
   # Attack runs replay old audit lines during phase 2; don't drop them for
   # being older than the default 1w rejection window.

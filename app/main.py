@@ -13,16 +13,44 @@ Run: uvicorn app.main:app --reload
 
 from __future__ import annotations
 
+import asyncio
+import contextlib
 import sys
 from contextlib import asynccontextmanager
 
+from pathlib import Path
+
 from fastapi import Depends, FastAPI, HTTPException, Request, status
-from fastapi.responses import JSONResponse
+from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
 from app import audit_log, ingest, rag_chain, secrets, vectorstore
+from app import chat as chat_store
+
+STATIC_DIR = Path(__file__).resolve().parent / "static"
 from app.auth import User, allowed_tiers, authenticate, current_user, issue_token, seed_users
 from app.filters.input_validation import ValidationError, validate_username
+
+
+SYNC_SECONDS = int(secrets.optional("CONNECTOR_SYNC_SECONDS", "60"))
+
+
+async def _connector_sync_loop(interval: int) -> None:
+    """Periodic background pull from the upstream source.
+
+    Runs with no user in the request — which is what production connector
+    ingestion looks like, and why `actor` is "system" rather than a person.
+    Failures are logged and the loop continues; an unreachable source should
+    not take the API down.
+    """
+    while True:
+        await asyncio.sleep(interval)
+        try:
+            await asyncio.to_thread(ingest.sync_connector)
+        except Exception as exc:  # noqa: BLE001 - loop must survive any failure
+            audit_log.log(
+                "connector.sync", decision="error", reason=type(exc).__name__
+            )
 
 
 @asynccontextmanager
@@ -41,7 +69,17 @@ async def lifespan(_: FastAPI):
             file=sys.stderr,
             flush=True,
         )
-    yield
+
+    task = None
+    if SYNC_SECONDS > 0:
+        task = asyncio.create_task(_connector_sync_loop(SYNC_SECONDS))
+    try:
+        yield
+    finally:
+        if task is not None:
+            task.cancel()
+            with contextlib.suppress(asyncio.CancelledError):
+                await task
 
 
 app = FastAPI(title="secureRAGapp", version="0.1.0", lifespan=lifespan)
@@ -54,6 +92,11 @@ class LoginRequest(BaseModel):
 
 class QueryRequest(BaseModel):
     question: str
+
+
+class ChatRequest(BaseModel):
+    message: str
+    session_id: str | None = None
 
 
 @app.exception_handler(ValidationError)
@@ -105,9 +148,42 @@ async def run_ingest(user: User = Depends(current_user)) -> dict[str, object]:
     if user.clearance != "restricted":
         audit_log.log("ingest.run", actor=user.username, decision="deny", reason="clearance")
         raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
-    return {"indexed": ingest.ingest_all(), "totals": vectorstore.stats()}
+    # A manual sync has a user behind it, unlike the scheduled loop.
+    return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
 
 
 @app.post("/query")
 async def query(body: QueryRequest, user: User = Depends(current_user)) -> dict[str, object]:
+    """Single-shot question. No conversation state."""
     return rag_chain.answer(body.question, user)
+
+
+@app.post("/chat")
+async def chat(body: ChatRequest, user: User = Depends(current_user)) -> dict[str, object]:
+    """Multi-turn question. Omit session_id to start a conversation.
+
+    An unknown or foreign session_id is rejected rather than silently starting a
+    new conversation — quietly issuing a fresh session would hide the fact that
+    the caller was reaching for someone else's.
+    """
+    if body.session_id:
+        session = chat_store.get(body.session_id, user.username)
+        if session is None:
+            audit_log.log(
+                "chat.session", actor=user.username, decision="deny",
+                reason="unknown_or_not_owned",
+            )
+            raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such session")
+    else:
+        session = chat_store.create(user.username)
+        audit_log.log("chat.session", actor=user.username, decision="allow", turns=0)
+
+    result = rag_chain.answer(body.message, user, chat_store.as_messages(session))
+    chat_store.append(session, body.message, result["answer"])
+    return {"session_id": session.session_id, "turns": len(session.turns), **result}
+
+
+@app.get("/")
+async def index() -> FileResponse:
+    """Minimal chat UI. Unauthenticated — it logs in via /login like any client."""
+    return FileResponse(STATIC_DIR / "index.html")

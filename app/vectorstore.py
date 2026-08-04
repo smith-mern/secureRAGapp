@@ -106,6 +106,20 @@ def delete_source(tier: str, source: str) -> None:
     _collection(tier).delete(where={"source": source})
 
 
+def indexed_state(tier: str, origin: str) -> dict[str, str]:
+    """Map source id -> content_hash for everything in `tier` from `origin`.
+
+    Lets a connector diff upstream against what is already indexed, so a sync
+    can skip unchanged records instead of re-embedding the whole corpus.
+    """
+    result = _collection(tier).get(where={"origin": origin}, include=["metadatas"])
+    return {
+        metadata["source"]: metadata.get("content_hash", "")
+        for metadata in result["metadatas"]
+        if metadata.get("source")
+    }
+
+
 def stats() -> dict[str, int]:
     """Chunk count per tier. Metadata only — safe to expose to an admin."""
     return {tier: _collection(tier).count() for tier in ("public", "internal", "restricted")}

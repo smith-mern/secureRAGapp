@@ -90,8 +90,13 @@ class ModelUnavailable(RuntimeError):
     """Ollama is not reachable or the model is not pulled."""
 
 
-def _generate(system: str, user_turn: str) -> str:
-    """One non-streaming chat completion against the local daemon."""
+def _generate(system: str, user_turn: str, history: list[dict[str, str]] | None = None) -> str:
+    """One non-streaming chat completion against the local daemon.
+
+    `history` is prior turns of this conversation, oldest first. It sits between
+    the system prompt and the current turn, so earlier answers stay visible for
+    follow-up questions.
+    """
     try:
         response = _get_client().post(
             "/api/chat",
@@ -100,6 +105,7 @@ def _generate(system: str, user_turn: str) -> str:
                 "stream": False,
                 "messages": [
                     {"role": "system", "content": system},
+                    *(history or []),
                     {"role": "user", "content": user_turn},
                 ],
                 "options": {"temperature": TEMPERATURE, "num_ctx": NUM_CTX},
@@ -132,12 +138,19 @@ def _build_user_turn(question: str, chunks: list[dict[str, Any]]) -> str:
     )
 
 
-def answer(raw_question: str, user: User) -> dict[str, Any]:
+def answer(
+    raw_question: str, user: User, history: list[dict[str, str]] | None = None
+) -> dict[str, Any]:
     """Answer one question for one user.
 
     Returns {answer, sources, refused, flags}. Every early return is a refusal
     with a reason recorded in the audit log, so a blocked request is
     distinguishable from an unanswerable one in phase 2.
+
+    `history` carries prior turns for multi-turn chat. Retrieval still runs
+    against the current question alone — a production system would rewrite the
+    query using the history first, so a bare follow-up like "and internationally?"
+    currently retrieves poorly.
     """
     secure = filters_enabled()
 
@@ -190,7 +203,7 @@ def answer(raw_question: str, user: User) -> dict[str, Any]:
         }
 
     try:
-        text = _generate(SYSTEM_PROMPT, _build_user_turn(question, grounded))
+        text = _generate(SYSTEM_PROMPT, _build_user_turn(question, grounded), history)
     except ModelUnavailable as exc:
         audit_log.log(
             "query.model_unavailable", actor=user.username, decision="error",

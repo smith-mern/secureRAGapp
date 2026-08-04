@@ -56,7 +56,28 @@ def optional(name: str, default: str) -> str:
     return os.environ.get(name) or default
 
 
+def filters_enabled() -> bool:
+    """Whether the security layer is active.
+
+    Defaults to FALSE. Phase 1 of this project ships deliberately exploitable so
+    phase 2 can demonstrate working attacks; phase 3 sets this to true and re-runs
+    the same attack suite to show them failing. Read at call time, not import, so
+    a test can flip it without reimporting the app.
+
+    This is an insecure default on purpose and only defensible because this is a
+    lab artifact. Do not copy this pattern into anything real.
+    """
+    return os.environ.get("SECURITY_FILTERS_ENABLED", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def check_required() -> None:
-    """Verify every required secret is present. Call once at startup."""
-    for name in ("ANTHROPIC_API_KEY", "SESSION_SIGNING_KEY"):
+    """Verify every required secret is present. Call once at startup.
+
+    Generation runs on a local Ollama daemon, so there is no model API key to
+    hold. SESSION_SIGNING_KEY is the only hard requirement — without it tokens
+    are unforgeable-in-name-only.
+    """
+    for name in ("SESSION_SIGNING_KEY",):
         require(name)

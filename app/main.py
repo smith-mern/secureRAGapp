@@ -13,6 +13,7 @@ Run: uvicorn app.main:app --reload
 
 from __future__ import annotations
 
+import sys
 from contextlib import asynccontextmanager
 
 from fastapi import Depends, FastAPI, HTTPException, Request, status
@@ -29,7 +30,17 @@ async def lifespan(_: FastAPI):
     # Fail at boot, not on the first request, if a secret is missing.
     secrets.check_required()
     seed_users()
-    audit_log.log("app.start", decision="allow")
+    secure = secrets.filters_enabled()
+    audit_log.log("app.start", decision="allow", mode="secure" if secure else "insecure")
+    if not secure:
+        # Loud on purpose. An app running exploitable should never be a surprise.
+        print(
+            "\n*** SECURITY FILTERS DISABLED — this instance is deliberately "
+            "exploitable.\n*** Set SECURITY_FILTERS_ENABLED=true to run the "
+            "hardened configuration.\n",
+            file=sys.stderr,
+            flush=True,
+        )
     yield
 
 

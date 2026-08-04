@@ -1,8 +1,7 @@
 fastapi
 uvicorn[standard]
 pydantic
-anthropic
 chromadb
+httpx
 python-dotenv
 pytest
-httpx

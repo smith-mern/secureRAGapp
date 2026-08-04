@@ -13,7 +13,7 @@ app/
   auth.py              identity, sessions, access scoping
   ingest.py            document intake, chunking, provenance
   vectorstore.py       embeddings + scoped similarity search
-  rag_chain.py         retrieve -> prompt -> Claude -> filter
+  rag_chain.py         retrieve -> prompt -> local model -> filter
   filters/
     input_validation.py  trust-boundary validation
     prompt_filter.py     prompt injection defense (query + retrieved text)
@@ -31,12 +31,19 @@ implementation yet.
 
 ## Setup
 
+Generation and embedding both run locally — no model API key, and no document
+text leaves the machine.
+
 ```sh
+ollama pull gemma4:12b          # or set OLLAMA_MODEL to one you already have
 python -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env   # then fill it in
+cp .env.example .env            # set SESSION_SIGNING_KEY and DEMO_USERS
 uvicorn app.main:app --reload
 ```
+
+Drop documents into `data/documents/{public,internal,restricted}/`, then
+`POST /ingest` as a restricted-clearance user to index them.
 
 ## Security posture
 

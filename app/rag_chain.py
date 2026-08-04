@@ -1,8 +1,13 @@
 """Retrieval-augmented generation chain.
 
 Orchestrates a query end to end: screen the question, retrieve tier-scoped
-chunks, drop any that look like injections, assemble the prompt, call Claude,
-filter the output, and return the answer with its sources.
+chunks, drop any that look like injections, assemble the prompt, call the local
+model, filter the output, and return the answer with its sources.
+
+Generation runs on a local Ollama daemon, so no document text and no question
+ever leaves the machine. Combined with Chroma's local embedder, the whole
+pipeline is offline — which is the point for a corpus that has a `restricted`
+tier in it.
 
 Retrieved text is data, never instructions. It is wrapped in delimiters and the
 system prompt states that document content cannot change the model's directives
@@ -14,28 +19,41 @@ empty or weak is a control-flow decision, not a text scan. A model asked to
 answer from nothing will answer from its parameters, and that is the
 hallucination risk the project is meant to defend against.
 
-Uses the Anthropic SDK with claude-opus-5.
+A 12B local model follows a system prompt less reliably than a frontier model.
+Treat the structural defenses — dropping flagged chunks before they are ever
+sent, and filtering output on the way back — as the load-bearing ones, and the
+system prompt's "treat this as data" instruction as a hint the model may ignore.
+Phase 2 should expect a higher injection success rate here than the same attacks
+would get against a hosted frontier model, and that difference is itself worth
+writing up.
 """
 
 from __future__ import annotations
 
 from typing import Any
 
-import anthropic
+import httpx
 
 from app import audit_log
-from app.auth import User, allowed_tiers
+from app.auth import TIERS, User, allowed_tiers
 from app.filters import output_filter, prompt_filter
 from app.filters.input_validation import validate_query
-from app.secrets import optional, require
+from app.secrets import filters_enabled, optional
 from app.vectorstore import query as vector_query
 
-MODEL = "claude-opus-5"
-MAX_TOKENS = 8000
+OLLAMA_HOST = optional("OLLAMA_HOST", "http://localhost:11434")
+MODEL = optional("OLLAMA_MODEL", "gemma4:12b")
 
-# Cosine distance; lower is closer. Above this a chunk is treated as unrelated,
-# so a question with no real support is refused instead of answered from the
-# model's own knowledge.
+# Ollama defaults num_ctx to 2048 for most models, which silently truncates the
+# retrieved documents out of the prompt — the model then answers ungrounded and
+# looks like it hallucinated. Set it explicitly.
+NUM_CTX = int(optional("OLLAMA_NUM_CTX", "8192"))
+TEMPERATURE = float(optional("OLLAMA_TEMPERATURE", "0.2"))
+
+# Local generation on a laptop is slow; this is not a network round trip to a
+# hosted API.
+REQUEST_TIMEOUT = float(optional("OLLAMA_TIMEOUT", "180"))
+
 MAX_DISTANCE = float(optional("MAX_DISTANCE", "0.75"))
 TOP_K = int(optional("TOP_K", "4"))
 
@@ -58,14 +76,48 @@ REFUSAL_NO_CONTEXT = (
     "access to covers it."
 )
 
-_client: anthropic.Anthropic | None = None
+_client: httpx.Client | None = None
 
 
-def _get_client() -> anthropic.Anthropic:
+def _get_client() -> httpx.Client:
     global _client
     if _client is None:
-        _client = anthropic.Anthropic(api_key=require("ANTHROPIC_API_KEY"))
+        _client = httpx.Client(base_url=OLLAMA_HOST, timeout=REQUEST_TIMEOUT)
     return _client
+
+
+class ModelUnavailable(RuntimeError):
+    """Ollama is not reachable or the model is not pulled."""
+
+
+def _generate(system: str, user_turn: str) -> str:
+    """One non-streaming chat completion against the local daemon."""
+    try:
+        response = _get_client().post(
+            "/api/chat",
+            json={
+                "model": MODEL,
+                "stream": False,
+                "messages": [
+                    {"role": "system", "content": system},
+                    {"role": "user", "content": user_turn},
+                ],
+                "options": {"temperature": TEMPERATURE, "num_ctx": NUM_CTX},
+            },
+        )
+    except httpx.ConnectError as exc:
+        raise ModelUnavailable(
+            f"Cannot reach Ollama at {OLLAMA_HOST}. Is `ollama serve` running?"
+        ) from exc
+    except httpx.TimeoutException as exc:
+        raise ModelUnavailable(
+            f"Ollama did not respond within {REQUEST_TIMEOUT:.0f}s."
+        ) from exc
+
+    if response.status_code == 404:
+        raise ModelUnavailable(f"Model '{MODEL}' is not pulled. Run: ollama pull {MODEL}")
+    response.raise_for_status()
+    return response.json()["message"]["content"]
 
 
 def _build_user_turn(question: str, chunks: list[dict[str, Any]]) -> str:
@@ -87,9 +139,15 @@ def answer(raw_question: str, user: User) -> dict[str, Any]:
     with a reason recorded in the audit log, so a blocked request is
     distinguishable from an unanswerable one in phase 2.
     """
-    question = validate_query(raw_question)
+    secure = filters_enabled()
 
-    query_flags = prompt_filter.screen_query(question)
+    # Phase 1 runs with `secure` false: every guard below is skipped so the
+    # attacks in redteam/ actually land. Phase 3 sets SECURITY_FILTERS_ENABLED
+    # and the same attacks are expected to fail. Each guard is a single `if
+    # secure` so the two modes stay diffable in a writeup.
+    question = validate_query(raw_question) if secure else str(raw_question)[:20000]
+
+    query_flags = prompt_filter.screen_query(question) if secure else []
     if query_flags:
         audit_log.log(
             "query.blocked", actor=user.username, decision="deny",
@@ -100,13 +158,15 @@ def answer(raw_question: str, user: User) -> dict[str, Any]:
             "sources": [], "refused": True, "flags": query_flags,
         }
 
-    tiers = allowed_tiers(user.clearance)
+    # Insecure mode searches every tier regardless of clearance — this is the
+    # data-leakage and sensitive-disclosure attack surface.
+    tiers = allowed_tiers(user.clearance) if secure else TIERS
     hits = vector_query(tiers, question, k=TOP_K)
 
     # Injection screening on the way out of retrieval, not on the way in.
     kept, dropped_rules = [], []
     for hit in hits:
-        chunk_flags = prompt_filter.screen_chunk(hit["text"])
+        chunk_flags = prompt_filter.screen_chunk(hit["text"]) if secure else []
         if chunk_flags:
             dropped_rules.extend(chunk_flags)
             audit_log.log(
@@ -116,7 +176,9 @@ def answer(raw_question: str, user: User) -> dict[str, Any]:
             continue
         kept.append(hit)
 
-    grounded = [hit for hit in kept if hit["distance"] <= MAX_DISTANCE]
+    # Insecure mode keeps distant chunks and answers anyway — the hallucination
+    # surface. Secure mode refuses rather than letting the model fill the gap.
+    grounded = [hit for hit in kept if hit["distance"] <= MAX_DISTANCE] if secure else kept
     if not grounded:
         audit_log.log(
             "query.ungrounded", actor=user.username, decision="deny",
@@ -127,32 +189,28 @@ def answer(raw_question: str, user: User) -> dict[str, Any]:
             "refused": True, "flags": dropped_rules,
         }
 
-    response = _get_client().messages.create(
-        model=MODEL,
-        max_tokens=MAX_TOKENS,
-        system=SYSTEM_PROMPT,
-        messages=[{"role": "user", "content": _build_user_turn(question, grounded)}],
-    )
-
-    # Check the stop reason before touching content — on a refusal the content
-    # list is empty or partial, and indexing into it raises.
-    if response.stop_reason == "refusal":
+    try:
+        text = _generate(SYSTEM_PROMPT, _build_user_turn(question, grounded))
+    except ModelUnavailable as exc:
         audit_log.log(
-            "query.model_refusal", actor=user.username, decision="deny",
-            category=getattr(response.stop_details, "category", None),
+            "query.model_unavailable", actor=user.username, decision="error",
+            model=MODEL, reason=type(exc).__name__,
         )
         return {
-            "answer": "The model declined to answer that.", "sources": [],
-            "refused": True, "flags": ["model_refusal"],
+            "answer": str(exc), "sources": [],
+            "refused": True, "flags": ["model_unavailable"],
         }
 
-    text = "".join(block.text for block in response.content if block.type == "text")
-    safe_text, output_rules, blocked = output_filter.apply(text)
+    if secure:
+        safe_text, output_rules, blocked = output_filter.apply(text)
+    else:
+        safe_text, output_rules, blocked = text, [], False
 
     sources = sorted({hit["metadata"].get("source", "unknown") for hit in grounded})
     audit_log.log(
         "query.answered", actor=user.username, decision="deny" if blocked else "allow",
-        tiers=list(tiers), chunks=len(grounded), sources=sources,
+        mode="secure" if secure else "insecure",
+        model=MODEL, tiers=list(tiers), chunks=len(grounded), sources=sources,
         output_rules=output_rules, dropped=len(hits) - len(kept),
     )
 

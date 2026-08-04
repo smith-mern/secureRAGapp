@@ -36,13 +36,6 @@
     border-radius: 8px; padding: 10px 13px;
   }
   .msg.refused .body { color: var(--warn); }
-  .sources {
-    margin-top: 8px; font: 12px/1.5 ui-monospace, Menlo, monospace; color: var(--muted);
-  }
-  .sources code {
-    background: var(--panel); border: 1px solid var(--line);
-    border-radius: 4px; padding: 1px 6px; margin-right: 6px; display: inline-block;
-  }
   footer { border-top: 1px solid var(--line); padding: 14px 20px; }
   form { max-width: 780px; margin: 0 auto; display: flex; gap: 10px; }
   input, button {
@@ -96,17 +89,6 @@
     body.className = 'body';
     body.textContent = text;
     el.append(label, body);
-    if (opts.sources && opts.sources.length) {
-      const s = document.createElement('div');
-      s.className = 'sources';
-      s.append('sources: ');
-      for (const src of opts.sources) {
-        const c = document.createElement('code');
-        c.textContent = src;
-        s.append(c);
-      }
-      el.append(s);
-    }
     log.append(el);
     el.scrollIntoView({ block: 'end' });
     return el;
@@ -165,7 +147,6 @@
       add('assistant', data.answer, {
         label: data.refused ? 'assistant · refused' : 'assistant',
         refused: data.refused,
-        sources: data.sources,
       });
     } catch (err) {
       pending.remove();

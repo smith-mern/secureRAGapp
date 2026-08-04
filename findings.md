@@ -3,6 +3,12 @@
 Running log of security findings for secureRAGapp. Each entry follows
 Vulnerability / Exploit / Detection / Mitigation.
 
+Entries that are not exploitable — forensics and monitoring gaps, which degrade
+response after an incident rather than enabling one — state that in a **Class**
+line and replace *Exploit* with an impact section. Presenting them as
+exploitable would inflate the report; omitting them would understate real
+weaknesses.
+
 **How to read this file.** Two columns decide whether a finding is real work or
 scripted demo:
 
@@ -36,6 +42,7 @@ documents. Accounts: `alice` (clearance `restricted`), `carol` (clearance
 | F-009 | Audit log has no integrity protection | Logging & monitoring | Confirmed by inspection | **Yes** |
 | F-010 | Vector store holds every tier in cleartext on disk | Sensitive data exposure | Confirmed | **Yes** |
 | F-011 | Grafana shares app credentials and exposes the full audit stream | Broken access control | Confirmed | **Yes** |
+| F-012 | Corpus changes cannot be attributed to a user | Forensics gap | Confirmed | **Yes** |
 
 ---
 
@@ -324,6 +331,59 @@ into this pipeline.
 visibility, Loki multi-tenancy with a tenant per clearance level — a
 substantially larger build, and the reason this is documented rather than
 fixed.
+
+---
+
+## F-012 — Corpus changes cannot be attributed to a user
+
+**Status:** Confirmed · **Persists with filters on:** Yes
+
+**Class:** Forensics gap. This is not an exploitable vulnerability and should
+not be written up as one — no attacker action is required or enabled by it. It
+degrades the ability to reconstruct what happened *after* an incident.
+
+**Vulnerability.** `app/ingest.py` calls `audit_log.log("ingest.file", ...)` and
+`audit_log.log("ingest.run", ...)` without an `actor`, so both default to
+`"anonymous"`. Ingestion determines what every future query can retrieve, and
+the record does not say who performed it. `ingest_all()` and `ingest_tier()`
+never receive the user object, so the identity is already gone by the time the
+log is written.
+
+The denial path in `app/main.py` *does* pass `actor=user.username`. A refused
+ingest names the user; a successful one does not. Attribution is present
+exactly where it matters least.
+
+**Observed.** `POST /ingest` authenticated as `alice`, immediately after an
+`auth.login` correctly recorded as `actor: "alice"`:
+
+```json
+{"actor":"anonymous","event":"ingest.file","source":"public/poisoned.md","tier":"public","chunks":1,...}
+{"actor":"anonymous","event":"ingest.run","public":2,"internal":0,"restricted":1,...}
+```
+
+**Impact on investigation.** `/ingest` accepts no body and cannot introduce a
+document — it re-indexes files already present in `data/documents/`. Corpus
+poisoning therefore requires filesystem write access, not API access, and an
+attacker who has that can already read every tier from `data/chroma_db/`
+(F-010) without touching the app.
+
+The consequence is not that an attack becomes possible, but that after one you
+cannot answer "who indexed this document, and when did it enter the corpus".
+The trigger may also have been pulled by an innocent user, or by a scheduled
+job, with nothing distinguishing the cases. Combined with F-009 — the log is
+freely rewritable — there is no trustworthy account of corpus history at all.
+
+**Detection.** Not detectable from the audit log; that is the finding. The only
+available correlation is a preceding `auth.login` close in time, which is
+circumstantial and fails under concurrent users.
+
+**Mitigation.** Thread the authenticated user through `ingest_all(user)` and
+`ingest_tier(tier, user)` and pass `actor=user.username` on every record. The
+broader fix is the one in F-002: attribution belongs in middleware holding the
+request identity, rather than depending on each call site to remember. To make
+corpus history reconstructable, also record a content hash per indexed chunk so
+a document's contents at index time can be compared against what is on disk
+now.
 
 ---
 

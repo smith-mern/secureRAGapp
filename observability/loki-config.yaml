@@ -1,0 +1,39 @@
+# Single-binary Loki backed by the local filesystem. No clustering, no object
+# store — this indexes one JSON-lines file on one laptop.
+auth_enabled: false
+
+server:
+  http_listen_port: 3100
+  grpc_listen_port: 9096
+  log_level: warn
+
+common:
+  instance_addr: 127.0.0.1
+  path_prefix: ./observability/data/loki
+  storage:
+    filesystem:
+      chunks_directory: ./observability/data/loki/chunks
+      rules_directory: ./observability/data/loki/rules
+  replication_factor: 1
+  ring:
+    kvstore:
+      store: inmemory
+
+schema_config:
+  configs:
+    - from: 2024-01-01
+      store: tsdb
+      object_store: filesystem
+      schema: v13
+      index:
+        prefix: index_
+        period: 24h
+
+limits_config:
+  # Attack runs replay old audit lines during phase 2; don't drop them for
+  # being older than the default 1w rejection window.
+  reject_old_samples: false
+  allow_structured_metadata: true
+
+analytics:
+  reporting_enabled: false

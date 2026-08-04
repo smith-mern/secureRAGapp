@@ -1,0 +1,58 @@
+// Tails the audit log and ships it to Loki.
+//
+// The file stays the source of truth — the app never pushes to Loki directly.
+// If Loki is down, audit writes still succeed and Alloy backfills when it
+// returns. An app that logs over the network can lose the record of the very
+// incident that took the network down.
+
+local.file_match "audit" {
+  path_targets = [{
+    __path__ = sys.env("AUDIT_LOG_FILE"),
+    job      = "securerag",
+  }]
+}
+
+loki.source.file "audit" {
+  targets    = local.file_match.audit.targets
+  forward_to = [loki.process.audit.receiver]
+}
+
+loki.process "audit" {
+  forward_to = [loki.write.local.receiver]
+
+  // Pull the fields worth filtering on out of each JSON record.
+  stage.json {
+    expressions = {
+      event    = "event",
+      actor    = "actor",
+      decision = "decision",
+      mode     = "mode",
+      ts       = "ts",
+    }
+  }
+
+  // Promote them to labels. All four are low-cardinality here (a handful of
+  // users, a fixed event vocabulary) — do NOT add `source` or `sources`, which
+  // grow with the corpus and would blow up the index.
+  stage.labels {
+    values = {
+      event    = "",
+      actor    = "",
+      decision = "",
+      mode     = "",
+    }
+  }
+
+  // Use the app's own timestamp, not ingest time, so replayed attack runs land
+  // on the timeline where they actually happened.
+  stage.timestamp {
+    source = "ts"
+    format = "RFC3339"
+  }
+}
+
+loki.write "local" {
+  endpoint {
+    url = "http://localhost:3100/loki/api/v1/push"
+  }
+}

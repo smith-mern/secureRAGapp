@@ -1,0 +1,129 @@
+{
+  "uid": "securerag-audit",
+  "title": "secureRAG — audit stream",
+  "tags": ["securerag"],
+  "timezone": "browser",
+  "refresh": "5s",
+  "time": { "from": "now-1h", "to": "now" },
+  "panels": [
+    {
+      "type": "stat",
+      "title": "Queries answered",
+      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"securerag\", event=\"query.answered\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Denied / blocked",
+      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "orange", "value": 1 }
+            ]
+          }
+        }
+      },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"securerag\", decision=\"deny\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Failed logins",
+      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 5 }
+            ]
+          }
+        }
+      },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"securerag\", event=\"auth.login\", decision=\"deny\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
+      "title": "Mode",
+      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum by (mode) (count_over_time({job=\"securerag\", event=\"query.answered\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Events per minute by decision",
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "{{decision}}",
+          "expr": "sum by (decision) (count_over_time({job=\"securerag\"} [1m]))"
+        }
+      ]
+    },
+    {
+      "type": "logs",
+      "title": "Live audit stream",
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 12 },
+      "options": {
+        "showTime": true,
+        "sortOrder": "Descending",
+        "wrapLogMessage": true,
+        "prettifyLogMessage": true,
+        "enableLogDetails": true
+      },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "expr": "{job=\"securerag\"} |= `$search`"
+        }
+      ]
+    }
+  ],
+  "templating": {
+    "list": [
+      {
+        "name": "search",
+        "type": "textbox",
+        "label": "Filter",
+        "query": "",
+        "current": { "text": "", "value": "" }
+      }
+    ]
+  },
+  "schemaVersion": 39,
+  "version": 1
+}

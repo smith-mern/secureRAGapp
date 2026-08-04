@@ -8,4 +8,6 @@ audit.log
 # Generated at runtime. Contains embedded chunk text for every tier —
 # treat as sensitive, never commit.
 data/chroma_db/
-data/chroma_db/
+
+# observability runtime state
+observability/data/

@@ -81,9 +81,106 @@
       ]
     },
     {
+      "type": "stat",
+      "title": "Documents uploaded",
+      "gridPos": { "h": 6, "w": 6, "x": 0, "y": 4 },
+      "description": "Successful /upload calls. The only write path into retrieval an ordinary account can reach.",
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum (count_over_time({job=\"securerag\", event=\"ingest.upload\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "timeseries",
+      "title": "Uploads vs. refused write attempts",
+      "gridPos": { "h": 6, "w": 18, "x": 6, "y": 4 },
+      "description": "Both series on one timeline on purpose: an upload burst next to a run of refusals is somebody hunting for an account that can write.",
+      "fieldConfig": {
+        "defaults": {
+          "custom": { "drawStyle": "bars", "fillOpacity": 60, "lineWidth": 1 }
+        },
+        "overrides": [
+          {
+            "matcher": { "id": "byName", "options": "refused write attempt" },
+            "properties": [
+              { "id": "color", "value": { "mode": "fixed", "fixedColor": "red" } }
+            ]
+          }
+        ]
+      },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "legendFormat": "uploaded → {{tier}}",
+          "expr": "sum by (tier) (count_over_time({job=\"securerag\", event=\"ingest.upload\"} [1m]))"
+        },
+        {
+          "refId": "B",
+          "legendFormat": "refused write attempt",
+          "expr": "sum (count_over_time({job=\"securerag\", event=\"auth.role\", decision=\"deny\"} [1m]))"
+        }
+      ]
+    },
+    {
+      "type": "table",
+      "title": "Uploaded documents — who, what, where",
+      "gridPos": { "h": 9, "w": 24, "x": 0, "y": 10 },
+      "description": "`source` is parsed from the line rather than promoted to a label — document names grow with the corpus and have no business in the Loki index. The parser names only the four fields that are not already labels; parsing the whole record collides with them and yields duplicate `*_extracted` columns.",
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "range",
+          "expr": "{job=\"securerag\", event=\"ingest.upload\"} | json source=\"source\", chunks=\"chunks\", bytes=\"bytes\", replaced=\"replaced\""
+        }
+      ],
+      "transformations": [
+        { "id": "extractFields", "options": { "source": "labels" } },
+        {
+          "id": "organize",
+          "options": {
+            "excludeByName": {
+              "labels": true,
+              "Line": true,
+              "id": true,
+              "tsNs": true,
+              "event": true,
+              "decision": true,
+              "origin": true,
+              "job": true,
+              "filename": true,
+              "detected_level": true,
+              "service_name": true,
+              "ts": true
+            },
+            "indexByName": {
+              "Time": 0,
+              "actor": 1,
+              "tier": 2,
+              "source": 3,
+              "chunks": 4,
+              "bytes": 5,
+              "replaced": 6
+            },
+            "renameByName": {
+              "actor": "uploaded by",
+              "source": "document",
+              "replaced": "overwrote existing"
+            }
+          }
+        },
+        { "id": "sortBy", "options": { "sort": [{ "field": "Time", "desc": true }] } }
+      ]
+    },
+    {
       "type": "timeseries",
       "title": "Events per minute by decision",
-      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 4 },
+      "gridPos": { "h": 8, "w": 24, "x": 0, "y": 19 },
       "datasource": { "type": "loki", "uid": "securerag-loki" },
       "targets": [
         {
@@ -96,7 +193,7 @@
     {
       "type": "logs",
       "title": "Live audit stream",
-      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 12 },
+      "gridPos": { "h": 14, "w": 24, "x": 0, "y": 27 },
       "options": {
         "showTime": true,
         "sortOrder": "Descending",

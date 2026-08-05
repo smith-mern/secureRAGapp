@@ -27,19 +27,23 @@ loki.process "audit" {
       actor    = "actor",
       decision = "decision",
       mode     = "mode",
+      tier     = "tier",
       ts       = "ts",
     }
   }
 
-  // Promote them to labels. All four are low-cardinality here (a handful of
-  // users, a fixed event vocabulary) — do NOT add `source` or `sources`, which
-  // grow with the corpus and would blow up the index.
+  // Promote them to labels. All five are low-cardinality here (a handful of
+  // users, a fixed event vocabulary, three tiers) — do NOT add `source` or
+  // `sources`, which grow with the corpus and would blow up the index. Panels
+  // that need the document name parse it out of the line with `| json` at query
+  // time instead.
   stage.labels {
     values = {
       event    = "",
       actor    = "",
       decision = "",
       mode     = "",
+      tier     = "",
     }
   }
 

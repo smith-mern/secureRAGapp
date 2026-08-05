@@ -21,7 +21,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from fastapi import Header, HTTPException, status
+from fastapi import Depends, Header, HTTPException, status
 
 from app import audit_log
 from app.secrets import optional, require
@@ -29,6 +29,13 @@ from app.secrets import optional, require
 # Ordered least- to most-privileged. A clearance grants its own tier and every
 # tier below it.
 TIERS: tuple[str, ...] = ("public", "internal", "restricted")
+
+# Role is separate from clearance and is not ordered: clearance says which tiers
+# you may read, role says what you may do. They are deliberately disjoint so
+# "can write to the index" never falls out of "has a high clearance" — a reader
+# with restricted clearance still cannot ingest, and the uploader cannot query.
+ROLES: tuple[str, ...] = ("reader", "uploader")
+DEFAULT_ROLE = "reader"
 
 TOKEN_TTL_SECONDS = int(optional("SESSION_TTL_SECONDS", "3600"))
 
@@ -39,6 +46,7 @@ _SCRYPT = {"n": 2**14, "r": 8, "p": 1, "dklen": 32}
 class User:
     username: str
     clearance: str
+    role: str = DEFAULT_ROLE
 
 
 @dataclass(frozen=True)
@@ -46,6 +54,7 @@ class _Credential:
     salt: bytes
     digest: bytes
     clearance: str
+    role: str
 
 
 _USERS: dict[str, _Credential] = {}
@@ -67,17 +76,22 @@ def hash_password(password: str, salt: bytes | None = None) -> tuple[bytes, byte
     return salt, hashlib.scrypt(password.encode("utf-8"), salt=salt, **_SCRYPT)
 
 
-def create_user(username: str, password: str, clearance: str) -> None:
+def create_user(username: str, password: str, clearance: str, role: str = DEFAULT_ROLE) -> None:
     if clearance not in TIERS:
         raise ValueError(f"unknown clearance: {clearance}")
+    if role not in ROLES:
+        raise ValueError(f"unknown role: {role}")
     salt, digest = hash_password(password)
-    _USERS[username] = _Credential(salt=salt, digest=digest, clearance=clearance)
+    _USERS[username] = _Credential(salt=salt, digest=digest, clearance=clearance, role=role)
 
 
 def seed_users() -> int:
     """Load synthetic users from the DEMO_USERS env var (JSON).
 
-    Shape: {"alice": {"password": "...", "clearance": "restricted"}}
+    Shape: {"alice": {"password": "...", "clearance": "restricted", "role": "reader"}}
+
+    `role` is optional and defaults to "reader". Uploading is an opt-in role, so
+    a DEMO_USERS entry that forgets the field grants no write access.
 
     Deliberately not a default user table — an app that ships with a known
     account is an insecure default. Absent or malformed DEMO_USERS seeds
@@ -94,7 +108,12 @@ def seed_users() -> int:
 
     for username, entry in spec.items():
         try:
-            create_user(username, entry["password"], entry["clearance"])
+            create_user(
+                username,
+                entry["password"],
+                entry["clearance"],
+                entry.get("role", DEFAULT_ROLE),
+            )
         except (KeyError, TypeError, ValueError) as exc:
             audit_log.log(
                 "auth.seed", decision="error", user=username, reason=type(exc).__name__
@@ -110,7 +129,12 @@ def _sign(payload: bytes) -> str:
 
 def issue_token(user: User) -> str:
     payload = json.dumps(
-        {"sub": user.username, "clr": user.clearance, "exp": int(time.time()) + TOKEN_TTL_SECONDS},
+        {
+            "sub": user.username,
+            "clr": user.clearance,
+            "rol": user.role,
+            "exp": int(time.time()) + TOKEN_TTL_SECONDS,
+        },
         sort_keys=True,
     ).encode("utf-8")
     body = base64.urlsafe_b64encode(payload).decode("ascii").rstrip("=")
@@ -133,13 +157,15 @@ def verify_token(token: str) -> User | None:
         if claims["exp"] < time.time():
             return None
         clearance = claims["clr"]
+        role = claims["rol"]
     except (json.JSONDecodeError, KeyError, TypeError):
         return None
-    # Re-check the clearance against the current tier list rather than trusting
-    # whatever was signed at issue time.
-    if clearance not in TIERS:
+    # Re-check both against the current lists rather than trusting whatever was
+    # signed at issue time. A token missing "rol" fails here rather than
+    # defaulting — an old token should not silently acquire a role.
+    if clearance not in TIERS or role not in ROLES:
         return None
-    return User(username=claims["sub"], clearance=clearance)
+    return User(username=claims["sub"], clearance=clearance, role=role)
 
 
 def authenticate(username: str, password: str) -> User | None:
@@ -154,8 +180,11 @@ def authenticate(username: str, password: str) -> User | None:
     if not hmac.compare_digest(digest, credential.digest):
         audit_log.log("auth.login", actor=username, decision="deny", reason="bad_password")
         return None
-    audit_log.log("auth.login", actor=username, decision="allow", clearance=credential.clearance)
-    return User(username=username, clearance=credential.clearance)
+    audit_log.log(
+        "auth.login", actor=username, decision="allow",
+        clearance=credential.clearance, role=credential.role,
+    )
+    return User(username=username, clearance=credential.clearance, role=credential.role)
 
 
 async def current_user(authorization: str = Header(default="")) -> User:
@@ -170,3 +199,23 @@ async def current_user(authorization: str = Header(default="")) -> User:
             headers={"WWW-Authenticate": "Bearer"},
         )
     return user
+
+
+def require_role(role: str):
+    """Dependency that admits exactly one role. Not a hierarchy.
+
+    Uploader is not "reader plus writing" — an account that can put text into
+    the index cannot also pull text out of it, which keeps the ingestion
+    identity useless for reading anything it wrote.
+    """
+
+    async def dependency(user: User = Depends(current_user)) -> User:
+        if user.role != role:
+            audit_log.log(
+                "auth.role", actor=user.username, decision="deny",
+                required=role, actual=user.role,
+            )
+            raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+        return user
+
+    return dependency

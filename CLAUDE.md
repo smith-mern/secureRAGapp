@@ -17,6 +17,15 @@ Documents live in `data/documents/{public,internal,restricted}/`. The directory
 sets the access tier, which is written into chunk metadata at ingest and decides
 which Chroma collection a chunk lands in.
 
+Authorization is two independent axes. **Clearance** (`public` < `internal` <
+`restricted`) is ordered and says which tiers an account may touch. **Role** is
+not ordered and says what it may do: `reader` gets `/query` and `/chat`,
+`uploader` gets `/upload` and `/ingest`, and neither gets the other's. Role
+defaults to `reader`, so an account only writes to the index if someone said so
+explicitly. Uploads land in `data/uploads/<tier>/` with `origin="upload"` — kept
+apart from curated content because it is the only write path reachable with
+nothing but a password.
+
 ## Phases
 
 1. **Build vulnerable.** The app runs exploitable. `SECURITY_FILTERS_ENABLED`

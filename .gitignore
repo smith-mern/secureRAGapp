@@ -9,5 +9,12 @@ audit.log
 # treat as sensitive, never commit.
 data/chroma_db/
 
+# Uploaded through the API by the uploader role. Untrusted content, and it may
+# carry any tier — never commit.
+data/uploads/
+
 # observability runtime state
 observability/data/
+
+# serena MCP project scaffolding, not part of the app
+.serena/

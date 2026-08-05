@@ -28,7 +28,15 @@ from app import audit_log, ingest, rag_chain, secrets, vectorstore
 from app import chat as chat_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
-from app.auth import User, allowed_tiers, authenticate, current_user, issue_token, seed_users
+from app.auth import (
+    User,
+    allowed_tiers,
+    authenticate,
+    current_user,
+    issue_token,
+    require_role,
+    seed_users,
+)
 from app.filters.input_validation import ValidationError, validate_username
 
 
@@ -99,6 +107,14 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class UploadRequest(BaseModel):
+    filename: str
+    tier: str
+    # Text body rather than multipart: the ingest pipeline only accepts .txt and
+    # .md, so there is nothing binary to carry and no upload parser to add.
+    content: str
+
+
 @app.exception_handler(ValidationError)
 async def _validation_handler(_: Request, exc: ValidationError) -> JSONResponse:
     # The message states which rule failed and never repeats the input back.
@@ -126,40 +142,67 @@ async def login(body: LoginRequest) -> dict[str, str]:
         raise HTTPException(
             status_code=status.HTTP_401_UNAUTHORIZED, detail="Invalid credentials"
         )
-    return {"token": issue_token(user), "clearance": user.clearance}
+    return {"token": issue_token(user), "clearance": user.clearance, "role": user.role}
 
 
 @app.get("/me")
 async def me(user: User = Depends(current_user)) -> dict[str, object]:
+    tiers = allowed_tiers(user.clearance)
     return {
         "username": user.username,
         "clearance": user.clearance,
-        "readable_tiers": list(allowed_tiers(user.clearance)),
+        "role": user.role,
+        # Which lists are populated is the whole authorization model in one
+        # response, and it is what the UI switches on.
+        "readable_tiers": list(tiers) if user.role == "reader" else [],
+        "writable_tiers": list(tiers) if user.role == "uploader" else [],
     }
 
 
-@app.post("/ingest")
-async def run_ingest(user: User = Depends(current_user)) -> dict[str, object]:
-    """Re-index data/documents/. Restricted clearance only.
+@app.post("/upload")
+async def upload(
+    body: UploadRequest, user: User = Depends(require_role("uploader"))
+) -> dict[str, object]:
+    """Add one document to the index. `uploader` role only.
 
-    Ingestion decides what every future query can retrieve, so it sits behind
-    the highest clearance rather than plain authentication.
+    The only write path into retrieval that an ordinary account can reach, which
+    is why it is the one endpoint fenced off to a single role rather than to a
+    clearance level. The tier is still bounded by the uploader's clearance — the
+    role says they may write, the clearance says how far.
     """
-    if user.clearance != "restricted":
-        audit_log.log("ingest.run", actor=user.username, decision="deny", reason="clearance")
-        raise HTTPException(status_code=status.HTTP_403_FORBIDDEN, detail="Forbidden")
+    return ingest.store_upload(
+        filename=body.filename,
+        tier=body.tier,
+        content=body.content,
+        actor=user.username,
+        allowed_tiers=allowed_tiers(user.clearance),
+    )
+
+
+@app.post("/ingest")
+async def run_ingest(user: User = Depends(require_role("uploader"))) -> dict[str, object]:
+    """Rebuild the index from every source. `uploader` role only.
+
+    Same trust boundary as /upload: ingestion decides what every future query
+    can retrieve, so both live behind the role that exists to write, not behind
+    a high clearance that exists to read.
+    """
     # A manual sync has a user behind it, unlike the scheduled loop.
     return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
 
 
 @app.post("/query")
-async def query(body: QueryRequest, user: User = Depends(current_user)) -> dict[str, object]:
+async def query(
+    body: QueryRequest, user: User = Depends(require_role("reader"))
+) -> dict[str, object]:
     """Single-shot question. No conversation state."""
     return rag_chain.answer(body.question, user)
 
 
 @app.post("/chat")
-async def chat(body: ChatRequest, user: User = Depends(current_user)) -> dict[str, object]:
+async def chat(
+    body: ChatRequest, user: User = Depends(require_role("reader"))
+) -> dict[str, object]:
     """Multi-turn question. Omit session_id to start a conversation.
 
     An unknown or foreign session_id is rejected rather than silently starting a

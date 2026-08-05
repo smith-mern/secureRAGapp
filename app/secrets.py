@@ -24,6 +24,10 @@ load_dotenv()
 _REPO_ROOT = Path(__file__).resolve().parent.parent
 
 DOCUMENTS_DIR = _REPO_ROOT / "data" / "documents"
+# Uploads land outside DOCUMENTS_DIR so provenance survives: sweeping the two
+# roots separately is what lets a chunk keep origin="upload" instead of being
+# re-indexed as curated content on the next rebuild.
+UPLOADS_DIR = _REPO_ROOT / "data" / "uploads"
 CHROMA_DIR = _REPO_ROOT / "data" / "chroma_db"
 AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH") or _REPO_ROOT / "audit.log")
 

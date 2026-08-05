@@ -49,6 +49,21 @@
   button:disabled { opacity: .5; cursor: default; }
   .note { color: var(--muted); font-size: 13px; }
   .error { color: var(--warn); }
+  select {
+    font: inherit; border-radius: 8px; border: 1px solid var(--line);
+    background: var(--panel); color: var(--text); padding: 10px 13px;
+  }
+  .badge {
+    font: 600 10px/1 ui-monospace, Menlo, monospace; letter-spacing: 1px;
+    text-transform: uppercase; border: 1px solid var(--accent); color: var(--accent);
+    border-radius: 4px; padding: 4px 6px; margin-left: 8px;
+  }
+  #upload input[type=file] { flex: 1; padding: 8px 13px; cursor: pointer; }
+  #upload input[type=file]::file-selector-button {
+    font: inherit; font-weight: 600; margin-right: 10px; cursor: pointer;
+    border: 1px solid var(--line); border-radius: 6px; padding: 4px 10px;
+    background: var(--bg); color: var(--text);
+  }
 </style>
 </head>
 <body>
@@ -69,6 +84,11 @@
     <input id="message" placeholder="Ask a question…" autocomplete="off">
     <button type="submit" id="send">Send</button>
   </form>
+  <form id="upload" style="display:none">
+    <input id="file" type="file" accept=".txt,.md">
+    <select id="tier" title="Access tier for this document"></select>
+    <button type="submit" id="put">Upload</button>
+  </form>
 </footer>
 
 <script>
@@ -76,8 +96,18 @@
   const who = document.getElementById('who');
   const loginForm = document.getElementById('login');
   const composer = document.getElementById('composer');
+  const uploader = document.getElementById('upload');
   let token = null;
   let sessionId = null;
+
+  function signedOut(reason) {
+    add('system', reason, { label: 'error' });
+    composer.style.display = 'none';
+    uploader.style.display = 'none';
+    loginForm.style.display = 'flex';
+    who.textContent = 'not signed in';
+    token = null; sessionId = null;
+  }
 
   function add(role, text, opts = {}) {
     const el = document.createElement('div');
@@ -107,13 +137,70 @@
       if (!res.ok) { add('system', 'Sign-in failed.', { label: 'error' }); return; }
       const data = await res.json();
       token = data.token;
-      who.innerHTML = `<b>${username}</b> · clearance ${data.clearance}`;
+      // A new sign-in starts a new conversation. Carrying a session id across
+      // identities would send one user's session to /chat as another.
+      sessionId = null;
+      // textContent, not innerHTML — the username is attacker-chosen text.
+      who.textContent = '';
+      const name = document.createElement('b');
+      name.textContent = username;
+      const badge = document.createElement('span');
+      badge.className = 'badge';
+      badge.textContent = data.role;
+      who.append(name, ` · clearance ${data.clearance}`, badge);
+
       loginForm.style.display = 'none';
-      composer.style.display = 'flex';
-      document.getElementById('message').focus();
-      add('system', `Signed in as ${username} (${data.clearance}).`, { label: 'system' });
+      if (data.role === 'uploader') {
+        // The uploader has no read path at all: /query and /chat return 403 for
+        // this role, so the UI shows the one thing the account can actually do.
+        const me = await (await fetch('/me', {
+          headers: { authorization: 'Bearer ' + token },
+        })).json();
+        const tier = document.getElementById('tier');
+        tier.replaceChildren(...me.writable_tiers.map((t) => new Option(t, t)));
+        uploader.style.display = 'flex';
+        add('system',
+            `Signed in as ${username}. Upload-only account — questions are not available to this role.`,
+            { label: 'system' });
+      } else {
+        composer.style.display = 'flex';
+        document.getElementById('message').focus();
+        add('system', `Signed in as ${username} (${data.clearance}).`, { label: 'system' });
+      }
     } catch (err) {
       add('system', 'Cannot reach the API.', { label: 'error' });
+    }
+  });
+
+  uploader.addEventListener('submit', async (e) => {
+    e.preventDefault();
+    const picker = document.getElementById('file');
+    const put = document.getElementById('put');
+    const file = picker.files[0];
+    if (!file) return;
+    const tier = document.getElementById('tier').value;
+    put.disabled = true;
+    try {
+      const content = await file.text();
+      const res = await fetch('/upload', {
+        method: 'POST',
+        headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+        body: JSON.stringify({ filename: file.name, tier, content }),
+      });
+      if (res.status === 401) { signedOut('Session expired — sign in again.'); return; }
+      const data = await res.json();
+      if (!res.ok) {
+        add('system', data.detail || 'Upload rejected.', { label: 'error' });
+        return;
+      }
+      add('system',
+          `${data.replaced ? 'Replaced' : 'Indexed'} ${data.source} — ${data.chunks} chunk(s) in ${data.tier}.`,
+          { label: 'upload' });
+      picker.value = '';
+    } catch (err) {
+      add('system', 'Upload failed.', { label: 'error' });
+    } finally {
+      put.disabled = false;
     }
   });
 
@@ -128,18 +215,29 @@
     const pending = add('assistant', 'thinking…', { label: 'assistant' });
     send.disabled = true;
     try {
-      const res = await fetch('/chat', {
+      // `let`, not `const` — reassigned by the 404 recovery path below.
+      let res = await fetch('/chat', {
         method: 'POST',
         headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
         body: JSON.stringify({ message, session_id: sessionId }),
       });
       if (res.status === 401) {
         pending.remove();
-        add('system', 'Session expired — sign in again.', { label: 'error' });
-        composer.style.display = 'none';
-        loginForm.style.display = 'flex';
-        token = null; sessionId = null;
+        signedOut('Session expired — sign in again.');
         return;
+      }
+      // 404 means the conversation no longer exists server-side — sessions are
+      // in-memory, so a server restart drops them. Start a fresh conversation
+      // and resend rather than making the user retype.
+      if (res.status === 404) {
+        sessionId = null;
+        res = await fetch('/chat', {
+          method: 'POST',
+          headers: { 'content-type': 'application/json', authorization: 'Bearer ' + token },
+          body: JSON.stringify({ message, session_id: null }),
+        });
+        add('system', 'Previous conversation was dropped by a server restart; started a new one.',
+            { label: 'system' });
       }
       const data = await res.json();
       sessionId = data.session_id || sessionId;

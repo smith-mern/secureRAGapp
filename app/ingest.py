@@ -6,6 +6,10 @@ boundary:
 - **Curated** — files under `data/documents/<tier>/`, placed by whoever
   administers the deployment. Tier comes from the directory. Trusted in the
   sense that writing here already requires host access.
+- **Upload** — files under `data/uploads/<tier>/`, submitted over the API by an
+  account holding the `uploader` role. No host access required, so this is the
+  lowest-trust of the three writable paths and the one an attacker reaches with
+  nothing but a password.
 - **Connector** — records pulled from the upstream source system by
   `app.connectors`. Tier is inherited from the source record's ACL. Anyone who
   can file a ticket can put text here, with no account on this application.
@@ -33,8 +37,13 @@ from pathlib import Path
 from app import audit_log, vectorstore
 from app.auth import TIERS
 from app.connectors import tickets
-from app.filters.input_validation import ValidationError, safe_document_path
-from app.secrets import DOCUMENTS_DIR, optional
+from app.filters.input_validation import (
+    ValidationError,
+    safe_document_path,
+    validate_filename,
+    validate_tier,
+)
+from app.secrets import DOCUMENTS_DIR, UPLOADS_DIR, optional
 
 ALLOWED_SUFFIXES = {".txt", ".md"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
@@ -43,6 +52,7 @@ CHUNK_CHARS = int(optional("CHUNK_CHARS", "1000"))
 CHUNK_OVERLAP = int(optional("CHUNK_OVERLAP", "150"))
 
 CURATED_ORIGIN = "curated"
+UPLOAD_ORIGIN = "upload"
 
 
 def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP) -> list[str]:
@@ -91,18 +101,29 @@ def _read_document(path: Path) -> str | None:
         return None
 
 
-def ingest_tier(tier: str, actor: str = "system") -> int:
-    """Index every curated document in one tier's directory."""
+def ingest_tier(
+    tier: str,
+    actor: str = "system",
+    base: Path = DOCUMENTS_DIR,
+    origin: str = CURATED_ORIGIN,
+) -> int:
+    """Index every document in one tier's directory under `base`."""
     if tier not in TIERS:
         raise ValidationError("unknown tier")
 
     # Resolve the root once and compare resolved-against-resolved throughout.
     # Mixing the two silently breaks wherever the root has a symlink in its
     # ancestry (/var -> /private/var on macOS, for one).
-    root = DOCUMENTS_DIR.resolve()
+    root = base.resolve()
     tier_dir = root / tier
     if not tier_dir.is_dir():
         return 0
+
+    # `source` is what chunk ids hash, so the two roots must not produce the
+    # same string for the same relative path — otherwise an upload named
+    # public/policy.md would silently overwrite the curated document of that
+    # name. Curated keeps its bare path so existing chunk ids stay stable.
+    prefix = "" if origin == CURATED_ORIGIN else f"{origin}/"
 
     written = 0
     for path in sorted(tier_dir.rglob("*")):
@@ -121,12 +142,12 @@ def ingest_tier(tier: str, actor: str = "system") -> int:
         if text is None:
             continue
 
-        source = str(resolved.relative_to(root))
-        count = _index(tier, source, text, {"origin": CURATED_ORIGIN})
+        source = prefix + str(resolved.relative_to(root))
+        count = _index(tier, source, text, {"origin": origin})
         written += count
         audit_log.log(
             "ingest.file", actor=actor, decision="allow",
-            origin=CURATED_ORIGIN, tier=tier, source=source, chunks=count,
+            origin=origin, tier=tier, source=source, chunks=count,
         )
 
     return written
@@ -137,6 +158,62 @@ def ingest_curated(actor: str = "system") -> dict[str, int]:
     result = {tier: ingest_tier(tier, actor) for tier in TIERS}
     audit_log.log("ingest.run", actor=actor, decision="allow", origin=CURATED_ORIGIN, **result)
     return result
+
+
+# --------------------------------------------------------------------------
+# Uploaded documents
+# --------------------------------------------------------------------------
+
+
+def ingest_uploads(actor: str = "system") -> dict[str, int]:
+    """Re-index every tier's uploaded documents from disk."""
+    result = {
+        tier: ingest_tier(tier, actor, UPLOADS_DIR, UPLOAD_ORIGIN) for tier in TIERS
+    }
+    audit_log.log("ingest.run", actor=actor, decision="allow", origin=UPLOAD_ORIGIN, **result)
+    return result
+
+
+def store_upload(
+    filename: str, tier: str, content: str, actor: str, allowed_tiers: tuple[str, ...]
+) -> dict[str, object]:
+    """Validate, persist, and index one uploaded document.
+
+    Every value here arrived over the network, so each is checked before it is
+    used for anything: the tier against what this uploader may write, the name
+    against the path rules, and the joined path against the root a second time
+    in case the name check ever loosens. The body is never inspected for
+    intent — uploaded text is data, and screening it for injection happens at
+    retrieval where the caller asking for it is known.
+    """
+    tier = validate_tier(tier, allowed_tiers)
+    filename = validate_filename(filename, ALLOWED_SUFFIXES)
+
+    if not isinstance(content, str) or not content.strip():
+        raise ValidationError("document is empty")
+    encoded = content.encode("utf-8")
+    if len(encoded) > MAX_FILE_BYTES:
+        raise ValidationError(f"document must be at most {MAX_FILE_BYTES} bytes")
+
+    root = UPLOADS_DIR.resolve()
+    tier_dir = root / tier
+    tier_dir.mkdir(parents=True, exist_ok=True)
+    destination = safe_document_path(root, tier_dir / filename)
+
+    replaced = destination.exists()
+    destination.write_bytes(encoded)
+
+    source = f"{UPLOAD_ORIGIN}/{tier}/{filename}"
+    if replaced:
+        # Chunk ids are source:index, so a shorter replacement would leave the
+        # tail of the previous version retrievable. Drop the old chunks first.
+        vectorstore.delete_source(tier, source)
+    chunks = _index(tier, source, content, {"origin": UPLOAD_ORIGIN, "uploaded_by": actor})
+    audit_log.log(
+        "ingest.upload", actor=actor, decision="allow", origin=UPLOAD_ORIGIN,
+        tier=tier, source=source, chunks=chunks, bytes=len(encoded), replaced=replaced,
+    )
+    return {"source": source, "tier": tier, "chunks": chunks, "replaced": replaced}
 
 
 # --------------------------------------------------------------------------
@@ -224,10 +301,11 @@ def sync_connector(actor: str = "system") -> dict[str, int]:
 
 
 def ingest_all(actor: str = "system") -> dict[str, dict[str, int]]:
-    """Index both sources. Connector failure does not block curated content."""
+    """Index every source. Connector failure does not block on-disk content."""
     curated = ingest_curated(actor)
+    uploads = ingest_uploads(actor)
     try:
         connector = sync_connector(actor)
     except tickets.SourceUnavailable:
         connector = {"error": "source_unavailable"}
-    return {"curated": curated, "connector": connector}
+    return {"curated": curated, "uploads": uploads, "connector": connector}

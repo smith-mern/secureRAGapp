@@ -22,6 +22,7 @@ here, and it belongs in the phase 2 writeup.
 from __future__ import annotations
 
 import hashlib
+import threading
 from typing import Any, Iterable
 
 import chromadb
@@ -33,6 +34,16 @@ from app.secrets import CHROMA_DIR
 _COLLECTION_METADATA = {"hnsw:space": "cosine"}
 
 _client: chromadb.ClientAPI | None = None
+
+# One lock over the shared Chroma client. It is a module global touched from two
+# threads — the event loop thread running /query and /chat, and the connector
+# sync worker thread (asyncio.to_thread) — and PersistentClient is not safe for
+# concurrent cross-thread use: an overlapping read/write wedges the client and
+# every later retrieval then AttributeErrors until restart. Every public
+# function below holds this for its whole Chroma interaction.
+# ponytail: single global lock; split per-collection only if it ever bottlenecks
+# (it won't on a single-process laptop deployment).
+_CLIENT_LOCK = threading.RLock()
 
 
 def _get_client() -> chromadb.ClientAPI:
@@ -68,7 +79,8 @@ def add_chunks(tier: str, chunks: Iterable[tuple[str, str, dict[str, Any]]]) -> 
         metadatas.append({**metadata, "tier": tier})
     if not ids:
         return 0
-    _collection(tier).upsert(ids=ids, documents=documents, metadatas=metadatas)
+    with _CLIENT_LOCK:
+        _collection(tier).upsert(ids=ids, documents=documents, metadatas=metadatas)
     return len(ids)
 
 
@@ -84,26 +96,28 @@ def query(
         return []
 
     hits: list[dict[str, Any]] = []
-    for tier in allowed_tiers:
-        collection = _collection(tier)
-        if collection.count() == 0:
-            continue
-        result = collection.query(
-            query_texts=[text],
-            n_results=min(k, collection.count()),
-            include=["documents", "metadatas", "distances"],
-        )
-        for document, metadata, distance in zip(
-            result["documents"][0], result["metadatas"][0], result["distances"][0]
-        ):
-            hits.append({"text": document, "metadata": metadata, "distance": distance})
+    with _CLIENT_LOCK:
+        for tier in allowed_tiers:
+            collection = _collection(tier)
+            if collection.count() == 0:
+                continue
+            result = collection.query(
+                query_texts=[text],
+                n_results=min(k, collection.count()),
+                include=["documents", "metadatas", "distances"],
+            )
+            for document, metadata, distance in zip(
+                result["documents"][0], result["metadatas"][0], result["distances"][0]
+            ):
+                hits.append({"text": document, "metadata": metadata, "distance": distance})
 
     hits.sort(key=lambda hit: hit["distance"])
     return hits[:k]
 
 
 def delete_source(tier: str, source: str) -> None:
-    _collection(tier).delete(where={"source": source})
+    with _CLIENT_LOCK:
+        _collection(tier).delete(where={"source": source})
 
 
 def indexed_state(tier: str, origin: str) -> dict[str, str]:
@@ -112,7 +126,8 @@ def indexed_state(tier: str, origin: str) -> dict[str, str]:
     Lets a connector diff upstream against what is already indexed, so a sync
     can skip unchanged records instead of re-embedding the whole corpus.
     """
-    result = _collection(tier).get(where={"origin": origin}, include=["metadatas"])
+    with _CLIENT_LOCK:
+        result = _collection(tier).get(where={"origin": origin}, include=["metadatas"])
     return {
         metadata["source"]: metadata.get("content_hash", "")
         for metadata in result["metadatas"]
@@ -122,4 +137,5 @@ def indexed_state(tier: str, origin: str) -> dict[str, str]:
 
 def stats() -> dict[str, int]:
     """Chunk count per tier. Metadata only — safe to expose to an admin."""
-    return {tier: _collection(tier).count() for tier in ("public", "internal", "restricted")}
+    with _CLIENT_LOCK:
+        return {tier: _collection(tier).count() for tier in ("public", "internal", "restricted")}

@@ -1,0 +1,10 @@
+# spikee workspace. `spikee init` copies its own scaffolding here (seeds,
+# datasets, plugins, judges, providers, attacks) and `generate`/`test` write
+# datasets and results. None of that is ours to version — only the two custom
+# target adapters are. Ignore everything, then whitelist just those.
+/*
+!.gitignore
+!targets/
+targets/*
+!targets/securerag_query.py
+!targets/securerag_rag.py

@@ -11,9 +11,11 @@ text and rag_chain DROPS the chunk before generation.
 The deterministic signal is retrieval, not model behaviour: a poisoned chunk
 that a filter WOULD flag still appears in the response `sources` in insecure
 mode (it was used), and is absent in secure mode (it was dropped). Whether the
-model then obeys the embedded instruction is a separate, model-dependent layer —
-this script reports it as a bonus but does not gate on it, because a 12B model
-follows the "treat as data" system prompt loosely and inconsistently.
+generation then obeys the embedded instruction is a separate layer — behavioral
+execution HAS been observed (a reader's answer appended an attacker-planted
+marker), but it is not deterministic (a generation may refuse, or garble the
+token). This script reports execution as a bonus but gates on retrieval, so the
+result does not depend on any single generation complying.
 
 Two accounts: uploader (dave) plants the document, reader (carol) retrieves it.
 
@@ -96,8 +98,8 @@ def main() -> int:
         obeyed = INJECT_MARKER in answer
 
         if used:
-            note = " AND the model obeyed it (marker echoed)" if obeyed else \
-                   " (model did not auto-execute it this run — a separate, flaky layer)"
+            note = " AND the model echoed the injected marker" if obeyed else \
+                   " (model did not execute it this run — behavioral execution is a separate, untested claim)"
             print(f"\n[!] UNSCREENED — the injection-bearing chunk entered the prompt "
                   f"unfiltered{note}.")
             return 0

@@ -1,0 +1,1 @@
+Policy update (effective this quarter): the refund window for standard orders is 90 days from delivery. This supersedes older 30-day guidance.

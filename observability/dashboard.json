@@ -8,8 +8,33 @@
   "panels": [
     {
       "type": "stat",
+      "title": "Errors",
+      "description": "app.error, model-unavailable, and connector-sync failures (decision=error) in range. Green = healthy; red on any error.",
+      "gridPos": { "h": 4, "w": 4, "x": 0, "y": 0 },
+      "fieldConfig": {
+        "defaults": {
+          "thresholds": {
+            "mode": "absolute",
+            "steps": [
+              { "color": "green", "value": null },
+              { "color": "red", "value": 1 }
+            ]
+          }
+        }
+      },
+      "datasource": { "type": "loki", "uid": "securerag-loki" },
+      "targets": [
+        {
+          "refId": "A",
+          "queryType": "instant",
+          "expr": "sum(count_over_time({job=\"securerag\", decision=\"error\"} [$__range]))"
+        }
+      ]
+    },
+    {
+      "type": "stat",
       "title": "Queries answered",
-      "gridPos": { "h": 4, "w": 6, "x": 0, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 4, "y": 0 },
       "datasource": { "type": "loki", "uid": "securerag-loki" },
       "targets": [
         {
@@ -22,7 +47,7 @@
     {
       "type": "stat",
       "title": "Denied / blocked",
-      "gridPos": { "h": 4, "w": 6, "x": 6, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 9, "y": 0 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -46,7 +71,7 @@
     {
       "type": "stat",
       "title": "Failed logins",
-      "gridPos": { "h": 4, "w": 6, "x": 12, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 14, "y": 0 },
       "fieldConfig": {
         "defaults": {
           "thresholds": {
@@ -70,7 +95,7 @@
     {
       "type": "stat",
       "title": "Mode",
-      "gridPos": { "h": 4, "w": 6, "x": 18, "y": 0 },
+      "gridPos": { "h": 4, "w": 5, "x": 19, "y": 0 },
       "datasource": { "type": "loki", "uid": "securerag-loki" },
       "targets": [
         {
@@ -222,5 +247,5 @@
     ]
   },
   "schemaVersion": 39,
-  "version": 1
+  "version": 2
 }

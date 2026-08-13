@@ -33,7 +33,7 @@ the finding *predicts* for phase 3 — none of it is verified yet.
 | [model-denial-of-service](redteam/findings/model-denial-of-service.md) — one reader stalls `/health` for everyone | High | no |
 | [source-name-disclosure](redteam/findings/source-name-disclosure.md) — `sources` leaks filenames and tiers across clearance | Medium | yes |
 | [improper-output-handling](redteam/findings/improper-output-handling.md) — attacker markup returned unencoded | Medium | no |
-| [supply-chain-vulnerabilities](redteam/findings/supply-chain-vulnerabilities.md) — 0/7 deps pinned; embedding model cache unverified | Medium | outside the flag's scope |
+| [supply-chain-vulnerabilities](redteam/findings/supply-chain-vulnerabilities.md) — 0/10 deps pinned; embedding model cache unverified | Medium | outside the flag's scope |
 
 Attack scripts run against a live app and are phase-agnostic — same script, both
 phases. The eight Python exploits signal by exit code: 0 means the exploit
@@ -45,6 +45,37 @@ SECURERAG_URL=http://localhost:8000 ATTACK_USER=carol ATTACK_PASS=... \
   python redteam/attacks/cross_tier_retrieval_leak.py
 ```
 
+## Pipeline
+
+Retrieval and generation are one LCEL chain, composed in `rag_chain.build_chain`
+and invoked by `answer`:
+
+```
+retrieve (TierScopedRetriever)
+  | screen chunks     drop anything matching the injection filter
+  | ground            drop chunks too distant to support an answer
+  | branch
+      no docs left -> refuse
+      otherwise    -> prompt | model | parse | egress filter
+```
+
+The security guards are chain steps, bound with `secure=` when the chain is
+built. Phase 2 builds them as pass-throughs and phase 3 builds them active — the
+pipeline's shape is identical either way, which is what keeps the two runs
+comparable.
+
+Two properties worth naming, because they are load-bearing and easy to undo:
+
+- The retriever's tier scope is **constructor state**, not a call argument.
+  There is no `invoke(query, tiers=...)` overload to forget, and an empty scope
+  retrieves nothing.
+- `SYSTEM_PROMPT` is passed as a literal `SystemMessage`, and retrieved text
+  goes in as a template **value**. LangChain does not re-template substituted
+  values, so a chunk containing `{braces}` cannot introduce a placeholder.
+
+Chroma is still the storage engine — `retriever.py` is the LangChain interface
+over it, not a migration.
+
 ## Layout
 
 ```
@@ -53,7 +84,9 @@ app/
   auth.py              identity, sessions, clearance + role checks
   ingest.py            document intake, chunking, provenance
   vectorstore.py       Chroma, one collection per tier
-  rag_chain.py         retrieve -> prompt -> LangChain chat model -> filter
+  retriever.py         TierScopedRetriever — Chroma as a LangChain BaseRetriever
+  rag_chain.py         the LCEL pipeline + provider selection
+  agent.py             agentic RAG: model calls retrieve() as a tool (opt-in)
   chat.py              in-memory multi-turn sessions
   connectors/tickets.py  scheduled sync from the upstream source system
   filters/             input validation, prompt screening, output egress — all gated off
@@ -67,20 +100,14 @@ redteam/
   fixtures/            injection payloads used by the attacks
   spikee/              spikee target adapters (direct + indirect/RAG), datasets, results
 observability/         Loki + Alloy + Grafana, native binaries, run.sh
-tests/test_roles.py    5 tests on the role/clearance split
+tests/                 22 tests: 9 role/clearance, 7 provider, 6 pipeline
+  conftest.py          redirects AUDIT_LOG_PATH to tmp — audit.log is phase 2 evidence
 ```
 
 ## Setup
 
 Generation and embedding both run locally by default — no model API key, no
 document text leaves the machine.
-
-Generation goes through LangChain, so the provider is one env var.
-`LLM_PROVIDER=ollama` (the default) keeps it local; `LLM_PROVIDER=groq` with a
-`GROQ_API_KEY` swaps in Groq's free hosted tier, which is much faster but sends
-questions and retrieved chunks — restricted tier included — to a third party.
-Run phase 2 and phase 3 on the local provider so the two are comparable.
-Embeddings stay on this machine either way.
 
 ```sh
 ollama pull gemma4:12b          # or set OLLAMA_MODEL to one you already have
@@ -100,6 +127,31 @@ directory sets the tier — then `POST /ingest` as an `uploader` account.
 from curated content because it is the only write path reachable with nothing
 but a password.
 
+## Model provider
+
+Two env vars change what runs. **Both defaults are what phase 2 and phase 3
+results must be produced under** — change either and the runs stop being
+comparable to the findings.
+
+| Var | Default | Effect |
+|---|---|---|
+| `LLM_PROVIDER` | `ollama` | `ollama` keeps generation on this machine. `groq` uses Groq's free hosted tier — faster, but see below. |
+| `AGENTIC_RAG` | `false` | `true` swaps the fixed pipeline for `agent.py`, where the model calls `retrieve()` as a tool. |
+
+`LLM_PROVIDER=groq` needs a `GROQ_API_KEY` and **sends every question and every
+retrieved chunk, restricted tier included, to a third party.** That voids the
+offline property the threat model is built on, so the app prints a banner and
+logs an `app.remote_llm` audit event on startup. Embeddings stay local either
+way — Chroma's embedder never crosses the network.
+
+`AGENTIC_RAG=true` is a separate track, not part of the phase-2/3 comparison. It
+buys query rewriting for free: the model turns a bare follow-up like "and
+internationally?" into a standalone search instead of retrieving on the raw
+text. It needs a model that tool-calls reliably — Groq's 70B does, the local 12B
+mostly does not. The tier is closed over from the authenticated request and is
+never a tool argument, so a model steered by an injected chunk still cannot
+widen its own scope.
+
 ## Authorization
 
 Two independent axes. **Clearance** (`public` < `internal` < `restricted`) is
@@ -115,6 +167,10 @@ prompt filter is regex and falls to homoglyphs, encoding, or an instruction
 split across chunks; `data/chroma_db/` stores every tier in the clear so
 filesystem access bypasses auth entirely; and a 12B local model follows a system
 prompt loosely. Report what still fails — do not claim the attacks are solved.
+
+Run it on the defaults: `LLM_PROVIDER=ollama`, `AGENTIC_RAG=false`. Phase 2 was
+captured against the local model and the fixed pipeline, so a phase 3 run on a
+hosted 70B or on the agentic path is measuring a different system.
 
 The defense code is gated, not absent. Do not delete it, and do not enable it by
 default before phase 3, or the two runs stop being comparable.

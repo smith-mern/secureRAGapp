@@ -77,6 +77,21 @@ async def lifespan(_: FastAPI):
             file=sys.stderr,
             flush=True,
         )
+    if rag_chain.PROVIDER != "ollama":
+        # Same reasoning as the banner above: a change this consequential to the
+        # threat model should never be discovered by reading the config later.
+        audit_log.log(
+            "app.remote_llm", decision="allow",
+            provider=rag_chain.PROVIDER, model=rag_chain.MODEL,
+        )
+        print(
+            f"\n*** REMOTE LLM — LLM_PROVIDER={rag_chain.PROVIDER}. Questions and "
+            "retrieved document text,\n*** including the restricted tier, are sent "
+            "to a third party. Set LLM_PROVIDER=ollama\n*** to keep generation on "
+            "this machine.\n",
+            file=sys.stderr,
+            flush=True,
+        )
 
     task = None
     if SYNC_SECONDS > 0:

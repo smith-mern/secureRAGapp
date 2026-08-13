@@ -53,7 +53,7 @@ app/
   auth.py              identity, sessions, clearance + role checks
   ingest.py            document intake, chunking, provenance
   vectorstore.py       Chroma, one collection per tier
-  rag_chain.py         retrieve -> prompt -> local Ollama -> filter
+  rag_chain.py         retrieve -> prompt -> LangChain chat model -> filter
   chat.py              in-memory multi-turn sessions
   connectors/tickets.py  scheduled sync from the upstream source system
   filters/             input validation, prompt screening, output egress — all gated off
@@ -72,8 +72,15 @@ tests/test_roles.py    5 tests on the role/clearance split
 
 ## Setup
 
-Generation and embedding both run locally — no model API key, no document text
-leaves the machine.
+Generation and embedding both run locally by default — no model API key, no
+document text leaves the machine.
+
+Generation goes through LangChain, so the provider is one env var.
+`LLM_PROVIDER=ollama` (the default) keeps it local; `LLM_PROVIDER=groq` with a
+`GROQ_API_KEY` swaps in Groq's free hosted tier, which is much faster but sends
+questions and retrieved chunks — restricted tier included — to a third party.
+Run phase 2 and phase 3 on the local provider so the two are comparable.
+Embeddings stay on this machine either way.
 
 ```sh
 ollama pull gemma4:12b          # or set OLLAMA_MODEL to one you already have

@@ -5,3 +5,10 @@ chromadb
 httpx
 python-dotenv
 pytest
+
+# LLM layer. langchain-ollama is the default provider (local, offline);
+# langchain-groq is only imported when LLM_PROVIDER=groq and can be dropped from
+# a local-only install. Both pull langchain-core.
+langchain-core
+langchain-ollama
+langchain-groq

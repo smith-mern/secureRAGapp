@@ -8,10 +8,16 @@ is an injection vector into the model's context.
 
 ## Stack
 
-Generation runs on a local Ollama daemon (default `gemma4:12b`, set via
-`OLLAMA_MODEL`). Embeddings and vector search run on Chroma's local embedder,
-one collection per access tier. Nothing leaves the machine and there is no model
-API key. FastAPI is the API layer.
+Generation goes through a LangChain chat model selected by `LLM_PROVIDER`.
+Default is `ollama` — a local daemon (`gemma4:12b`, set via `OLLAMA_MODEL`) with
+no API key, so nothing leaves the machine. `groq` is an opt-in alternative using
+Groq's free hosted tier (`GROQ_MODEL`, `GROQ_API_KEY`); it is faster but sends
+questions and retrieved chunks to a third party, which voids the offline
+property the threat model assumes. Keep phase 2 and phase 3 runs on `ollama` so
+they stay comparable, and never point the restricted tier at a hosted provider.
+
+Embeddings and vector search always run on Chroma's local embedder, one
+collection per access tier, regardless of provider. FastAPI is the API layer.
 
 Documents live in `data/documents/{public,internal,restricted}/`. The directory
 sets the access tier, which is written into chunk metadata at ingest and decides

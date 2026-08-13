@@ -76,12 +76,31 @@ def filters_enabled() -> bool:
     )
 
 
+def agentic_enabled() -> bool:
+    """Whether the model drives retrieval as a tool (agentic RAG).
+
+    Defaults to FALSE, so the phase-2/3 pipeline is unchanged unless asked for.
+    Reliable only on a tool-calling provider (Groq); the local 12B mostly does
+    not tool-call. Read at call time, like `filters_enabled`.
+    """
+    return os.environ.get("AGENTIC_RAG", "false").strip().lower() in (
+        "1", "true", "yes", "on",
+    )
+
+
 def check_required() -> None:
     """Verify every required secret is present. Call once at startup.
 
-    Generation runs on a local Ollama daemon, so there is no model API key to
-    hold. SESSION_SIGNING_KEY is the only hard requirement — without it tokens
-    are unforgeable-in-name-only.
+    SESSION_SIGNING_KEY is always required — without it tokens are
+    unforgeable-in-name-only.
+
+    A model API key is required only when LLM_PROVIDER sends prompts off the
+    machine. The default provider is the local Ollama daemon, which needs no
+    key, so the offline configuration still boots with nothing but the signing
+    key set.
     """
-    for name in ("SESSION_SIGNING_KEY",):
+    names = ["SESSION_SIGNING_KEY"]
+    if os.environ.get("LLM_PROVIDER", "ollama").strip().lower() == "groq":
+        names.append("GROQ_API_KEY")
+    for name in names:
         require(name)

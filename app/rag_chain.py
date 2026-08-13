@@ -1,13 +1,35 @@
 """Retrieval-augmented generation chain.
 
-Orchestrates a query end to end: screen the question, retrieve tier-scoped
-chunks, drop any that look like injections, assemble the prompt, call the local
-model, filter the output, and return the answer with its sources.
+One LCEL pipeline, composed in `build_chain` and invoked by `answer`:
 
-Generation runs on a local Ollama daemon, so no document text and no question
-ever leaves the machine. Combined with Chroma's local embedder, the whole
-pipeline is offline — which is the point for a corpus that has a `restricted`
-tier in it.
+    retrieve (TierScopedRetriever)
+      | screen chunks       drop anything that looks like an injection
+      | ground              drop chunks too distant to support an answer
+      | branch
+          no docs left  ->  refuse
+          otherwise     ->  prompt | model | parse | egress filter
+
+Retrieval is a step *inside* the chain, not a separate call made before it, so
+the retriever's tier scope, the prompt, and the model are one composed object
+rather than three things a function happens to call in order.
+
+The security guards are chain steps too. Each is bound with `secure=` at build
+time: phase 1 builds them as pass-throughs, phase 3 builds them active, and the
+pipeline's shape is identical either way — which is what keeps the two runs
+comparable.
+
+Generation goes through a LangChain chat model chosen by `LLM_PROVIDER`:
+
+  ollama (default) — local daemon. No document text and no question leaves the
+    machine. Combined with Chroma's local embedder the whole pipeline is
+    offline, which is the point for a corpus with a `restricted` tier in it.
+  groq — hosted API. Fast and free-tier, but every retrieved chunk and every
+    question is sent to a third party. That breaks the offline property this
+    app was built around: `restricted` document text would leave the machine.
+    Opt-in only, and not appropriate for the restricted tier.
+
+Embeddings are unaffected either way — Chroma's local embedder always runs on
+this machine, so the vector index never crosses the network.
 
 Retrieved text is data, never instructions. It is wrapped in delimiters and the
 system prompt states that document content cannot change the model's directives
@@ -30,28 +52,36 @@ writing up.
 
 from __future__ import annotations
 
+from functools import partial
 from typing import Any
-
-import httpx
 
 from app import audit_log
 from app.auth import TIERS, User, allowed_tiers
 from app.filters import output_filter, prompt_filter
 from app.filters.input_validation import validate_query
-from app.secrets import filters_enabled, optional
-from app.vectorstore import query as vector_query
+from app.retriever import TierScopedRetriever, source_of
+from app.secrets import agentic_enabled, filters_enabled, optional, require
+
+# "ollama" keeps generation on this machine and is the default. "groq" sends
+# prompts to a third party — see the module docstring before enabling it.
+PROVIDER = optional("LLM_PROVIDER", "ollama").strip().lower()
 
 OLLAMA_HOST = optional("OLLAMA_HOST", "http://localhost:11434")
-MODEL = optional("OLLAMA_MODEL", "gemma4:12b")
+OLLAMA_MODEL = optional("OLLAMA_MODEL", "gemma4:12b")
+GROQ_MODEL = optional("GROQ_MODEL", "llama-3.3-70b-versatile")
+
+# What the audit log and error messages call the active model.
+MODEL = GROQ_MODEL if PROVIDER == "groq" else OLLAMA_MODEL
 
 # Ollama defaults num_ctx to 2048 for most models, which silently truncates the
 # retrieved documents out of the prompt — the model then answers ungrounded and
-# looks like it hallucinated. Set it explicitly.
+# looks like it hallucinated. Set it explicitly. Groq sizes context per model
+# and has no equivalent knob.
 NUM_CTX = int(optional("OLLAMA_NUM_CTX", "8192"))
 TEMPERATURE = float(optional("OLLAMA_TEMPERATURE", "0.2"))
 
 # Local generation on a laptop is slow; this is not a network round trip to a
-# hosted API.
+# hosted API. Groq is far faster, but the same ceiling does no harm.
 REQUEST_TIMEOUT = float(optional("OLLAMA_TIMEOUT", "180"))
 
 MAX_DISTANCE = float(optional("MAX_DISTANCE", "0.75"))
@@ -80,65 +110,237 @@ REFUSAL_NO_CONTEXT = (
     "access to covers it."
 )
 
-_client: httpx.Client | None = None
-
-
-def _get_client() -> httpx.Client:
-    global _client
-    if _client is None:
-        _client = httpx.Client(base_url=OLLAMA_HOST, timeout=REQUEST_TIMEOUT)
-    return _client
+_model: Any = None
 
 
 class ModelUnavailable(RuntimeError):
-    """Ollama is not reachable or the model is not pulled."""
+    """The configured model could not be reached or refused the request.
 
-
-def _generate(system: str, user_turn: str, history: list[dict[str, str]] | None = None) -> str:
-    """One non-streaming chat completion against the local daemon.
-
-    `history` is prior turns of this conversation, oldest first. It sits between
-    the system prompt and the current turn, so earlier answers stay visible for
-    follow-up questions.
+    Carries a short operator-facing message. Never carries an API key, a
+    provider error body, or any part of the prompt — this string is returned to
+    the caller by `answer`, so anything in it is disclosed.
     """
-    try:
-        response = _get_client().post(
-            "/api/chat",
-            json={
-                "model": MODEL,
-                "stream": False,
-                "messages": [
-                    {"role": "system", "content": system},
-                    *(history or []),
-                    {"role": "user", "content": user_turn},
-                ],
-                "options": {"temperature": TEMPERATURE, "num_ctx": NUM_CTX},
-            },
+
+
+def _build_model() -> Any:
+    """Construct the LangChain chat model for `LLM_PROVIDER`.
+
+    Imports are inside the branch so only the provider actually in use needs to
+    be installed: a local-only checkout never imports langchain_groq, and a
+    Groq-only deployment never needs langchain_ollama.
+    """
+    if PROVIDER == "ollama":
+        from langchain_ollama import ChatOllama
+
+        return ChatOllama(
+            model=OLLAMA_MODEL,
+            base_url=OLLAMA_HOST,
+            temperature=TEMPERATURE,
+            num_ctx=NUM_CTX,
+            client_kwargs={"timeout": REQUEST_TIMEOUT},
         )
-    except httpx.ConnectError as exc:
+
+    if PROVIDER == "groq":
+        from langchain_groq import ChatGroq
+
+        # require() raises if unset rather than letting the SDK fall back to a
+        # bare GROQ_API_KEY lookup and fail later with a confusing 401.
+        return ChatGroq(
+            model=GROQ_MODEL,
+            api_key=require("GROQ_API_KEY"),
+            temperature=TEMPERATURE,
+            timeout=REQUEST_TIMEOUT,
+            max_retries=2,
+        )
+
+    raise ModelUnavailable(f"Unknown LLM_PROVIDER '{PROVIDER}'. Use 'ollama' or 'groq'.")
+
+
+def _get_model() -> Any:
+    global _model
+    if _model is None:
+        _model = _build_model()
+    return _model
+
+
+def _history_messages(history: list[dict[str, str]] | None) -> list[Any]:
+    from langchain_core.messages import AIMessage, HumanMessage
+
+    messages: list[Any] = []
+    for turn in history or []:
+        content = turn.get("content", "")
+        # Anything that is not a known assistant turn is treated as user text.
+        # History comes from chat.py, but defaulting to the lower-trust role
+        # means a malformed entry cannot smuggle text in as a model utterance.
+        if turn.get("role") == "assistant":
+            messages.append(AIMessage(content=content))
+        else:
+            messages.append(HumanMessage(content=content))
+    return messages
+
+
+def _invoke_model(messages: Any) -> Any:
+    """Model call as a chain step, with the provider's error tree contained."""
+    try:
+        return _get_model().invoke(messages)
+    except ModelUnavailable:
+        raise
+    except Exception as exc:  # noqa: BLE001 - provider SDKs raise their own trees
+        # Only the exception *type* crosses this boundary. Provider error bodies
+        # can echo request content back, and this message reaches the caller.
         raise ModelUnavailable(
-            f"Cannot reach Ollama at {OLLAMA_HOST}. Is `ollama serve` running?"
-        ) from exc
-    except httpx.TimeoutException as exc:
-        raise ModelUnavailable(
-            f"Ollama did not respond within {REQUEST_TIMEOUT:.0f}s."
+            f"{PROVIDER} model '{MODEL}' is unavailable ({type(exc).__name__})."
         ) from exc
 
-    if response.status_code == 404:
-        raise ModelUnavailable(f"Model '{MODEL}' is not pulled. Run: ollama pull {MODEL}")
-    response.raise_for_status()
-    return response.json()["message"]["content"]
+
+def _format_documents(documents: list[Any]) -> str:
+    return "\n\n".join(
+        f'<document source="{source_of(doc)}">\n{doc.page_content}\n</document>'
+        for doc in documents
+    )
 
 
-def _build_user_turn(question: str, chunks: list[dict[str, Any]]) -> str:
-    blocks = []
-    for chunk in chunks:
-        source = chunk["metadata"].get("source", "unknown")
-        blocks.append(f'<document source="{source}">\n{chunk["text"]}\n</document>')
-    documents = "\n\n".join(blocks)
+def _prompt() -> Any:
+    """The prompt as a template, not a hand-assembled string.
+
+    SYSTEM_PROMPT is passed as a literal SystemMessage rather than a template
+    string so it is never run through f-string formatting. Retrieved text goes
+    in as a *value* for {documents}, and LangChain does not re-template
+    substituted values — so a chunk containing braces cannot introduce a new
+    placeholder. That property is load-bearing here: document text is hostile.
+    """
+    from langchain_core.messages import SystemMessage
+    from langchain_core.prompts import ChatPromptTemplate, MessagesPlaceholder
+
+    return ChatPromptTemplate.from_messages(
+        [
+            SystemMessage(content=SYSTEM_PROMPT),
+            MessagesPlaceholder("history"),
+            (
+                "human",
+                "<retrieved_documents>\n{documents}\n</retrieved_documents>\n\n"
+                "Question: {question}",
+            ),
+        ]
+    )
+
+
+# ---------------------------------------------------------------------------
+# Pipeline steps. Each takes the chain state dict and returns it, so the guards
+# compose with `|` instead of sitting outside the chain as imperative code.
+# `secure` is bound per request: phase 1 runs every step as a pass-through,
+# phase 3 turns them on, and the chain shape is identical in both.
+# ---------------------------------------------------------------------------
+
+
+def _screen_documents(state: dict[str, Any], *, user: User, secure: bool) -> dict[str, Any]:
+    """Drop retrieved chunks that look like injections, before the prompt step."""
+    kept, dropped_rules = [], []
+    for doc in state["docs"]:
+        chunk_flags = prompt_filter.screen_chunk(doc.page_content) if secure else []
+        if chunk_flags:
+            dropped_rules.extend(chunk_flags)
+            audit_log.log(
+                "retrieval.chunk_dropped", actor=user.username, decision="deny",
+                source=source_of(doc), rules=chunk_flags,
+            )
+            continue
+        kept.append(doc)
+    return {
+        **state,
+        "docs": kept,
+        "flags": state["flags"] + dropped_rules,
+        "retrieved": len(state["docs"]),
+        "dropped": len(state["docs"]) - len(kept),
+    }
+
+
+def _ground(state: dict[str, Any], *, secure: bool) -> dict[str, Any]:
+    """Drop chunks too distant to support an answer.
+
+    Insecure mode keeps them and answers anyway — the hallucination surface.
+    """
+    if not secure:
+        return state
+    close = [d for d in state["docs"] if d.metadata.get("distance", 0.0) <= MAX_DISTANCE]
+    return {**state, "docs": close}
+
+
+def _refuse_ungrounded(state: dict[str, Any], *, user: User, tiers: tuple[str, ...]) -> dict[str, Any]:
+    audit_log.log(
+        "query.ungrounded", actor=user.username, decision="deny",
+        tiers=list(tiers), retrieved=state.get("retrieved", 0),
+        dropped=state.get("dropped", 0),
+    )
+    return {
+        "answer": REFUSAL_NO_CONTEXT, "sources": [],
+        "refused": True, "flags": state["flags"],
+    }
+
+
+def _finalize(
+    state: dict[str, Any], *, user: User, secure: bool, tiers: tuple[str, ...]
+) -> dict[str, Any]:
+    """Egress filtering and audit, on the model's text."""
+    text = state["text"]
+    if secure:
+        safe_text, output_rules, blocked = output_filter.apply(text)
+    else:
+        safe_text, output_rules, blocked = text, [], False
+
+    sources = sorted({source_of(doc) for doc in state["docs"]})
+    audit_log.log(
+        "query.answered", actor=user.username, decision="deny" if blocked else "allow",
+        mode="secure" if secure else "insecure",
+        provider=PROVIDER,
+        model=MODEL, tiers=list(tiers), chunks=len(state["docs"]), sources=sources,
+        output_rules=output_rules, dropped=state.get("dropped", 0),
+    )
+    return {
+        "answer": safe_text,
+        "sources": [] if blocked else sources,
+        "refused": blocked,
+        "flags": state["flags"] + output_rules,
+    }
+
+
+def build_chain(user: User, secure: bool, tiers: tuple[str, ...]) -> Any:
+    """Compose the RAG pipeline for one request.
+
+    retrieve -> screen chunks -> ground -> (refuse | prompt -> model -> parse
+    -> filter). Built per request because the retriever's tier scope and the
+    audit actor are request state, not module state.
+    """
+    from langchain_core.output_parsers import StrOutputParser
+    from langchain_core.runnables import RunnableBranch, RunnableLambda, RunnablePassthrough
+
+    retriever = TierScopedRetriever(allowed=tuple(tiers), k=TOP_K)
+
+    generate = (
+        RunnableLambda(
+            lambda state: {
+                "documents": _format_documents(state["docs"]),
+                "question": state["question"],
+                "history": _history_messages(state["history"]),
+            }
+        )
+        | _prompt()
+        | RunnableLambda(_invoke_model)
+        | StrOutputParser()
+    )
+
+    respond = RunnablePassthrough.assign(text=generate) | RunnableLambda(
+        partial(_finalize, user=user, secure=secure, tiers=tiers)
+    )
+    refuse = RunnableLambda(partial(_refuse_ungrounded, user=user, tiers=tiers))
+
     return (
-        f"<retrieved_documents>\n{documents}\n</retrieved_documents>\n\n"
-        f"Question: {question}"
+        RunnablePassthrough.assign(
+            docs=RunnableLambda(lambda state: state["question"]) | retriever
+        )
+        | RunnableLambda(partial(_screen_documents, user=user, secure=secure))
+        | RunnableLambda(partial(_ground, secure=secure))
+        | RunnableBranch((lambda state: not state["docs"], refuse), respond)
     )
 
 
@@ -147,8 +349,12 @@ def answer(
 ) -> dict[str, Any]:
     """Answer one question for one user.
 
-    Returns {answer, sources, refused, flags}. Every early return is a refusal
-    with a reason recorded in the audit log, so a blocked request is
+    Returns {answer, sources, refused, flags}. Query validation and screening
+    stay ahead of the chain: a blocked question must not reach retrieval at all,
+    so there is nothing to compose it with. Everything from retrieval onward is
+    the pipeline in `build_chain`.
+
+    Every refusal records a reason in the audit log, so a blocked request is
     distinguishable from an unanswerable one in phase 2.
 
     `history` carries prior turns for multi-turn chat. Retrieval still runs
@@ -176,64 +382,29 @@ def answer(
         }
 
     # Insecure mode searches every tier regardless of clearance — this is the
-    # data-leakage and sensitive-disclosure attack surface.
+    # data-leakage and sensitive-disclosure attack surface. The tier set is
+    # bound into the retriever, so nothing downstream can widen it.
     tiers = allowed_tiers(user.clearance) if secure else TIERS
-    hits = vector_query(tiers, question, k=TOP_K)
 
-    # Injection screening on the way out of retrieval, not on the way in.
-    kept, dropped_rules = [], []
-    for hit in hits:
-        chunk_flags = prompt_filter.screen_chunk(hit["text"]) if secure else []
-        if chunk_flags:
-            dropped_rules.extend(chunk_flags)
-            audit_log.log(
-                "retrieval.chunk_dropped", actor=user.username, decision="deny",
-                source=hit["metadata"].get("source"), rules=chunk_flags,
-            )
-            continue
-        kept.append(hit)
+    # Agentic path: the model invokes a `retrieve` tool instead of the fixed
+    # pre-retrieval step. Same pre-checks (validate, screen_query, tier binding)
+    # apply above; only the retrieve-and-answer stage differs. Imported lazily so
+    # the base pipeline has no dependency on the agent module.
+    if agentic_enabled():
+        from app.agent import answer_agentic
 
-    # Insecure mode keeps distant chunks and answers anyway — the hallucination
-    # surface. Secure mode refuses rather than letting the model fill the gap.
-    grounded = [hit for hit in kept if hit["distance"] <= MAX_DISTANCE] if secure else kept
-    if not grounded:
-        audit_log.log(
-            "query.ungrounded", actor=user.username, decision="deny",
-            tiers=list(tiers), retrieved=len(hits), dropped=len(hits) - len(kept),
-        )
-        return {
-            "answer": REFUSAL_NO_CONTEXT, "sources": [],
-            "refused": True, "flags": dropped_rules,
-        }
+        return answer_agentic(question, user, history, secure=secure, tiers=tiers)
 
     try:
-        text = _generate(SYSTEM_PROMPT, _build_user_turn(question, grounded), history)
+        return build_chain(user, secure, tiers).invoke(
+            {"question": question, "history": history or [], "flags": []}
+        )
     except ModelUnavailable as exc:
         audit_log.log(
             "query.model_unavailable", actor=user.username, decision="error",
-            model=MODEL, reason=type(exc).__name__,
+            provider=PROVIDER, model=MODEL, reason=type(exc).__name__,
         )
         return {
             "answer": str(exc), "sources": [],
             "refused": True, "flags": ["model_unavailable"],
         }
-
-    if secure:
-        safe_text, output_rules, blocked = output_filter.apply(text)
-    else:
-        safe_text, output_rules, blocked = text, [], False
-
-    sources = sorted({hit["metadata"].get("source", "unknown") for hit in grounded})
-    audit_log.log(
-        "query.answered", actor=user.username, decision="deny" if blocked else "allow",
-        mode="secure" if secure else "insecure",
-        model=MODEL, tiers=list(tiers), chunks=len(grounded), sources=sources,
-        output_rules=output_rules, dropped=len(hits) - len(kept),
-    )
-
-    return {
-        "answer": safe_text,
-        "sources": [] if blocked else sources,
-        "refused": blocked,
-        "flags": dropped_rules + output_rules,
-    }

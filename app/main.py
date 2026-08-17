@@ -206,12 +206,30 @@ async def run_ingest(user: User = Depends(require_role("uploader"))) -> dict[str
     return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
 
 
+def _without_filter_telemetry(result: dict[str, object]) -> dict[str, object]:
+    """Drop the names of the filter rules that fired before responding.
+
+    `flags` is internal telemetry: it names the exact rule that blocked a
+    chunk, a query, or a response. Server-side that is the audit trail. Handed
+    back to the caller it is an oracle, and the block cases are the worst of
+    them — withholding an answer because it contained an `anthropic_key` and
+    then reporting `anthropic_key` discloses the class of secret the refusal
+    existed to protect. It also lets a caller tune a payload against named
+    rules until the list comes back empty.
+
+    The rule names stay in `audit.log` (`output_rules`, `retrieval.chunk_dropped`),
+    so nothing is lost for defenders. `refused` still tells an honest client
+    that its request did not produce an answer.
+    """
+    return {**result, "flags": []}
+
+
 @app.post("/query")
 async def query(
     body: QueryRequest, user: User = Depends(require_role("reader"))
 ) -> dict[str, object]:
     """Single-shot question. No conversation state."""
-    return rag_chain.answer(body.question, user)
+    return _without_filter_telemetry(rag_chain.answer(body.question, user))
 
 
 @app.post("/chat")
@@ -238,7 +256,11 @@ async def chat(
 
     result = rag_chain.answer(body.message, user, chat_store.as_messages(session))
     chat_store.append(session, body.message, result["answer"])
-    return {"session_id": session.session_id, "turns": len(session.turns), **result}
+    return {
+        "session_id": session.session_id,
+        "turns": len(session.turns),
+        **_without_filter_telemetry(result),
+    }
 
 
 @app.get("/")

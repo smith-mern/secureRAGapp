@@ -16,6 +16,7 @@ attack next.
 from __future__ import annotations
 
 import re
+from typing import Any
 
 # (rule name, pattern). Names are stable identifiers — they end up in the audit
 # log and in phase 2 findings, so don't rename them casually.
@@ -67,3 +68,24 @@ def screen_chunk(text: str) -> list[str]:
     attacker's instructions on a third party's behalf.
     """
     return scan(text)
+
+
+def screen_document(document: Any) -> list[str]:
+    """Screen everything about a retrieved document that reaches the prompt.
+
+    `screen_chunk` alone is not enough: `_format_documents` also interpolates
+    `metadata["source"]`, and that string is attacker-reachable (an upstream
+    connector record id, a curated filename — neither goes through
+    `validate_filename`). Screening the body but not the source leaves a data
+    position that lands in the prompt uninspected, which is exactly the hole
+    the chunk screen exists to close.
+
+    Scanned separately rather than on a joined string so a rule cannot match
+    across the seam between source and body and report a match that is in
+    neither. Rule names are deduplicated but order is kept stable for the log.
+    """
+    seen: dict[str, None] = {}
+    for part in (str(document.metadata.get("source", "")), document.page_content):
+        for rule in scan(part):
+            seen[rule] = None
+    return list(seen)

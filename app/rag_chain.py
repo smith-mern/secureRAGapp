@@ -54,6 +54,7 @@ from __future__ import annotations
 
 from functools import partial
 from typing import Any
+from xml.sax.saxutils import quoteattr
 
 from app import audit_log
 from app.auth import TIERS, User, allowed_tiers
@@ -194,8 +195,13 @@ def _invoke_model(messages: Any) -> Any:
 
 
 def _format_documents(documents: list[Any]) -> str:
+    # quoteattr, not an f-string quote: `source` is metadata, and metadata is
+    # attacker-reachable (a connector record id, a curated filename). Unescaped,
+    # a source containing a quote closes the attribute and lets the rest of the
+    # string write prompt structure — a fake </retrieved_documents> plus its own
+    # instructions — from a position screen_chunk never inspects.
     return "\n\n".join(
-        f'<document source="{source_of(doc)}">\n{doc.page_content}\n</document>'
+        f"<document source={quoteattr(str(source_of(doc)))}>\n{doc.page_content}\n</document>"
         for doc in documents
     )
 
@@ -237,7 +243,7 @@ def _screen_documents(state: dict[str, Any], *, user: User, secure: bool) -> dic
     """Drop retrieved chunks that look like injections, before the prompt step."""
     kept, dropped_rules = [], []
     for doc in state["docs"]:
-        chunk_flags = prompt_filter.screen_chunk(doc.page_content) if secure else []
+        chunk_flags = prompt_filter.screen_document(doc) if secure else []
         if chunk_flags:
             dropped_rules.extend(chunk_flags)
             audit_log.log(

@@ -8,7 +8,7 @@ another user's history — a session id is a bearer-style reference, so without
 that check anyone holding or guessing an id could read someone else's
 conversation, including answers drawn from a tier they cannot access.
 
-ponytail: in-memory dict, lost on restart, no eviction beyond a turn cap.
+ponytail: in-memory dict, lost on restart, FIFO eviction at MAX_SESSIONS.
 Fine for a single-process laptop deployment; needs a real store the moment
 there is more than one worker.
 """
@@ -22,6 +22,13 @@ from dataclasses import dataclass, field
 # Turns kept per session. History is replayed into the prompt on every request,
 # so this bounds both context size and cost.
 MAX_TURNS = 10
+
+# Sessions live for the process, and `/chat` with no session_id mints a new one
+# on every call — unbounded, that is a memory leak any reader can drive by
+# looping requests that never reuse an id. Oldest is evicted first (dicts keep
+# insertion order), which costs an idle conversation its history rather than
+# costing the process its memory.
+MAX_SESSIONS = 1000
 
 
 @dataclass
@@ -45,6 +52,8 @@ def create(owner: str) -> Session:
     session = Session(session_id=str(uuid.uuid4()), owner=owner)
     with _LOCK:
         _SESSIONS[session.session_id] = session
+        while len(_SESSIONS) > MAX_SESSIONS:
+            del _SESSIONS[next(iter(_SESSIONS))]
     return session
 
 

@@ -54,10 +54,12 @@ from __future__ import annotations
 
 from functools import partial
 from typing import Any
+from xml.sax.saxutils import quoteattr
 
 from app import audit_log
 from app.auth import TIERS, User, allowed_tiers
 from app.filters import output_filter, prompt_filter
+from app import limits
 from app.filters.input_validation import validate_query
 from app.retriever import TierScopedRetriever, source_of
 from app.secrets import agentic_enabled, filters_enabled, optional, require
@@ -83,6 +85,13 @@ TEMPERATURE = float(optional("OLLAMA_TEMPERATURE", "0.2"))
 # Local generation on a laptop is slow; this is not a network round trip to a
 # hosted API. Groq is far faster, but the same ceiling does no harm.
 REQUEST_TIMEOUT = float(optional("OLLAMA_TIMEOUT", "180"))
+
+# Output length is the other half of per-request cost, and nothing in the prompt
+# bounds it: "repeat this paragraph forever" runs until the context or the
+# timeout ends it. Ollama defaults num_predict to -1, unlimited; Groq bills per
+# output token, so there the ceiling is money rather than seconds. Generous
+# enough for a prose answer over four chunks.
+MAX_OUTPUT_TOKENS = int(optional("MAX_OUTPUT_TOKENS", "1024"))
 
 MAX_DISTANCE = float(optional("MAX_DISTANCE", "0.75"))
 TOP_K = int(optional("TOP_K", "4"))
@@ -137,6 +146,7 @@ def _build_model() -> Any:
             base_url=OLLAMA_HOST,
             temperature=TEMPERATURE,
             num_ctx=NUM_CTX,
+            num_predict=MAX_OUTPUT_TOKENS,
             client_kwargs={"timeout": REQUEST_TIMEOUT},
         )
 
@@ -149,6 +159,7 @@ def _build_model() -> Any:
             model=GROQ_MODEL,
             api_key=require("GROQ_API_KEY"),
             temperature=TEMPERATURE,
+            max_tokens=MAX_OUTPUT_TOKENS,
             timeout=REQUEST_TIMEOUT,
             max_retries=2,
         )
@@ -194,8 +205,13 @@ def _invoke_model(messages: Any) -> Any:
 
 
 def _format_documents(documents: list[Any]) -> str:
+    # quoteattr, not an f-string quote: `source` is metadata, and metadata is
+    # attacker-reachable (a connector record id, a curated filename). Unescaped,
+    # a source containing a quote closes the attribute and lets the rest of the
+    # string write prompt structure — a fake </retrieved_documents> plus its own
+    # instructions — from a position screen_chunk never inspects.
     return "\n\n".join(
-        f'<document source="{source_of(doc)}">\n{doc.page_content}\n</document>'
+        f"<document source={quoteattr(str(source_of(doc)))}>\n{doc.page_content}\n</document>"
         for doc in documents
     )
 
@@ -237,7 +253,7 @@ def _screen_documents(state: dict[str, Any], *, user: User, secure: bool) -> dic
     """Drop retrieved chunks that look like injections, before the prompt step."""
     kept, dropped_rules = [], []
     for doc in state["docs"]:
-        chunk_flags = prompt_filter.screen_chunk(doc.page_content) if secure else []
+        chunk_flags = prompt_filter.screen_document(doc) if secure else []
         if chunk_flags:
             dropped_rules.extend(chunk_flags)
             audit_log.log(
@@ -390,15 +406,21 @@ def answer(
     # pre-retrieval step. Same pre-checks (validate, screen_query, tier binding)
     # apply above; only the retrieve-and-answer stage differs. Imported lazily so
     # the base pipeline has no dependency on the agent module.
-    if agentic_enabled():
-        from app.agent import answer_agentic
-
-        return answer_agentic(question, user, history, secure=secure, tiers=tiers)
-
+    # One slot per in-flight generation, held across the agentic loop too — that
+    # path can spend AGENT_MAX_TOOL_ITERS model calls on a single request, so
+    # metering requests without metering this would bound the cheap number.
     try:
-        return build_chain(user, secure, tiers).invoke(
-            {"question": question, "history": history or [], "flags": []}
-        )
+        with limits.generation_slot(user.username):
+            if agentic_enabled():
+                from app.agent import answer_agentic
+
+                return answer_agentic(
+                    question, user, history, secure=secure, tiers=tiers
+                )
+
+            return build_chain(user, secure, tiers).invoke(
+                {"question": question, "history": history or [], "flags": []}
+            )
     except ModelUnavailable as exc:
         audit_log.log(
             "query.model_unavailable", actor=user.username, decision="error",

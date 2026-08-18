@@ -7,21 +7,35 @@ exploitable, red-team it and capture the exploits as repeatable scripts, then
 turn the defenses on and report honestly what still fails.
 
 **Status: phase 2 done, phase 3 not started.** The app is fully implemented and
-runs vulnerable — `SECURITY_FILTERS_ENABLED` defaults to `false`. Nine findings
-are written up with working attack scripts. Nothing has been re-run with the
-flag on yet.
+runs vulnerable by default — `SECURITY_FILTERS_ENABLED` defaults to `false`.
+Nine findings are written up with working attack scripts. Phase 3 is underway:
+the deployment `.env` now sets the flag `true`, and re-runs have begun.
 
 | Phase | State |
 |---|---|
 | 1 — build vulnerable | complete |
 | 2 — attack | complete: 9 findings, 11 attack scripts, spikee harness wired |
-| 3 — secure & re-run | not started |
+| 3 — secure & re-run | in progress: 1 of 9 re-run and verified |
 
 ## Findings
 
 All nine live in `redteam/findings/` as Vulnerability / Exploit / Detection /
 Mitigation, each citing a script in `redteam/attacks/`. "Flag closes it" is what
-the finding *predicts* for phase 3 — none of it is verified yet.
+the finding *predicts* for phase 3; a finding is only settled once its
+Mitigation section cites an observed run, so treat the column as a prediction
+until then.
+
+Verified so far:
+
+- **chunk-injection-screening** — re-run 2026-08-17, `SCREENED` (exit 1), with a
+  `retrieval.chunk_dropped` audit event supplying causation. Phase 3 also closed
+  a gap the flag did not: `source` metadata reached the prompt unscreened and
+  unescaped.
+- **output-filter-bypass** — the flag blocks the verbatim planted credential,
+  but six of eight reformulations of that same secret defeat it (one inserted
+  space is enough). Enabling the filters also introduced a disclosure of their
+  own — blocked responses returned the *name* of the rule that fired — now
+  fixed. Script re-run still outstanding.
 
 | Finding | Sev | Flag closes it |
 |---|---|---|

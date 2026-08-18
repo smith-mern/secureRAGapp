@@ -9,7 +9,10 @@ rate limit, and blocking model calls on the single event loop.
 **Attack:** [`redteam/attacks/dos_carol.sh`](../attacks/dos_carol.sh) (sustained
 availability DoS), [`redteam/attacks/dos_chat_leak.sh`](../attacks/dos_chat_leak.sh)
 (session-store memory leak), [`redteam/attacks/model_denial_of_service.py`](../attacks/model_denial_of_service.py)
-(single-request amplification)
+(single-request amplification),
+[`redteam/attacks/unbounded_consumption.py`](../attacks/unbounded_consumption.py)
+(self-contained before/after probe added in phase 3 — event-loop starvation and
+unbounded request body, no Ollama needed)
 **Component:** `app/main.py:194` (`/query` is `async def`);
 `app/rag_chain.py:105` (blocking `httpx.Client.post` on the event loop, no
 `num_predict`); `app/vectorstore.py:46` (serialized retrieval); no rate limit
@@ -114,32 +117,128 @@ which the app emits.
 
 ## Mitigation
 
-Cheap, app-side controls in priority order:
+Applied in phase 3. Attack script:
+[`redteam/attacks/unbounded_consumption.py`](../attacks/unbounded_consumption.py),
+which is self-contained (boots the app in-process, needs no Ollama) and so gives
+a number rather than a stall description. `/login` is the cost source there —
+`authenticate` spends ~31 ms of CPU and ~16 MB of RAM in scrypt per attempt and
+hashes even for users that do not exist, so the amplifier needs no credentials at
+all. Measured before/after, 60 concurrent logins against a `/health` that touches
+neither auth nor the model:
 
-- **Do model I/O off the event loop.** Make `/query`/`/chat` handlers `def`
-  (FastAPI offloads sync handlers to a threadpool) or wrap `rag_chain.answer` in
-  `run_in_threadpool` / `asyncio.to_thread`, or switch `_generate` to
-  `httpx.AsyncClient` and `await` it. This alone stops one request from freezing
-  unrelated endpoints — the highest-severity part of this finding.
-- **Cap output.** Add `num_predict` to `_generate`'s options
-  (`app/rag_chain.py:115`); turns "up to 180s per request" into a bounded cost.
-- **Rate-limit per account.** A per-actor request/second and in-flight cap on
-  `/query`/`/chat` (e.g. `slowapi`, or a small token bucket keyed on
-  `user.username`) stops one reader from monopolizing the model.
-- **Shorten / role-scope the 180s timeout** — it is a long time to hold the only
-  model instance for one caller.
+```
+pre-fix (commit 9d08bfd)   [A]  1 ms ->  1970 ms   [B] 20 MB body accepted
+post-fix, filters off      [A]  1 ms ->   194 ms   [B] 20 MB body accepted
+post-fix, filters on       [A]  1 ms ->    26 ms   [B] 413
+```
 
-**Residual risk (per the phase-3 mandate — filters on does NOT close this):**
+**Unconditional — not behind the flag.** Blocking work on the event loop is a
+defect, not a defense to demonstrate, so these apply in both modes:
 
-- **`SECURITY_FILTERS_ENABLED` does nothing here.** None of the three facts above
-  is behind the flag: secure mode shrinks the *input* to 2000 chars via
-  `validate_query`, but the handler is still `async def` doing a blocking call,
-  still has no `num_predict`, and still has no rate limit. Flipping the switch and
-  re-running `dos_carol.sh` produces the same `/health` stall. Phase 3 must report
-  this class as **not mitigated by the gated defenses** — the fix is the code
-  changes above, which the flag does not provide.
-- **The single model instance is an architectural ceiling.** Even with the loop
-  unblocked and output capped, one local Ollama serving sequentially means enough
-  concurrent requests still queue; a rate limit raises the bar but a single-laptop
-  deployment can always be saturated. The honest phase-3 statement is "much
-  harder, not impossible."
+- **Handlers moved off the event loop.** `/login`, `/query`, `/chat`, `/upload`,
+  `/ingest` and `/review` are now plain `def`; FastAPI dispatches a sync handler
+  to the threadpool, which also caps how many run at once. `/health` and `/` do no
+  blocking work and stay `async def`. This is the 1970 -> 194 ms line, and it is
+  the load-bearing part of the finding: one request no longer freezes endpoints it
+  has nothing to do with.
+- **Output capped.** `MAX_OUTPUT_TOKENS` (default 1024) is passed as
+  `num_predict` to `ChatOllama` and `max_tokens` to `ChatGroq`
+  (`app/rag_chain.py`). Unset, Ollama's `num_predict` is -1 — unlimited — so
+  "repeat this forever" ran until `REQUEST_TIMEOUT` or the context ended it.
+- **Session store bounded.** `app/chat.py` evicts oldest-first at
+  `MAX_SESSIONS` (1000). This closes the leak in
+  [`dos_chat_leak.sh`](../attacks/dos_chat_leak.sh): `/chat` with no `session_id`
+  minted a session per call and nothing ever removed one, so the cost of an
+  unbounded memory footprint is now the cost of an idle conversation's history.
+
+**Gated on `SECURITY_FILTERS_ENABLED`,** in `app/limits.py`, so the phase 2 and
+phase 3 runs of the rest of the attack suite stay comparable:
+
+- **Per-caller rate limit** (`RATE_LIMIT_REQUESTS`, default 30 per 60 s;
+  `RATE_LIMIT_GENERATE`, 10, on `/query` and `/chat`; 10 on `/login`; 2 on
+  `/ingest`, which re-embeds the whole corpus). Metered on the **account** the
+  bearer token names — see UC-01 below, which is the bug from keying it on the
+  token — and on the peer address when there is no valid token, which is all an
+  unauthenticated `/login` offers. The token's HMAC is verified before its `sub`
+  claim is used, so a caller cannot mint a bucket per request, or spend someone
+  else's quota, by editing the claim. The limiter purges expired windows and
+  denies past `_MAX_KEYS` — fail closed, so it cannot itself become the
+  unbounded thing.
+- **Concurrent-generation ceiling** (`MAX_CONCURRENT_GENERATIONS`, default 2). A
+  rate limit bounds requests per window, not how many models are resident at
+  once. Held across the agentic loop as well, which can spend
+  `AGENT_MAX_TOOL_ITERS` model calls on one request. Past the ceiling a caller
+  waits `GENERATION_WAIT_SECONDS` and then gets a 503 with `Retry-After` rather
+  than joining an unbounded queue.
+- **Request body ceiling** (`MAX_BODY_BYTES`, default 4 MB), decided from
+  `Content-Length` in middleware before Starlette buffers anything. This is the
+  20 MB -> 413 line. Every input validator in the app ran *after* the body was
+  already resident, so `validate_query`'s 2000-char cap and the 2 MB document cap
+  in `app/ingest.py` were both bounding a copy of memory the caller had already
+  spent.
+
+Check: `tests/test_limits.py` — rate limit denies past the cap in secure mode and
+never in insecure mode, an oversized body is refused before parsing, the session
+store evicts, and a full generation ceiling refuses with 503.
+
+### UC-01 — per-token rate-limit bypass (found by red-team, fixed)
+
+The first cut of `app/limits.py` keyed the limiter on
+`sha256(bearer_token)`, on the reasoning that a token identifies its holder more
+tightly than an address does. It does not: `issue_token` embeds an `exp`
+timestamp, so **logging in twice yields two different token strings for one
+account**, each landing in its own bucket with its own fresh allowance. Looping
+`/login` — itself limited only per address, and cheap for a caller who already
+has valid credentials — multiplied the generation budget without bound. Two
+tokens for one account got 20 allowed `/query` calls against a limit of 10. On a
+hosted provider that is direct cost amplification, and it needed nothing but
+`reader`, the default role.
+
+The credential is not the identity. `_caller` now returns `"u:" + username` from
+`verify_token`, which checks the HMAC first so the `sub` claim cannot be chosen
+by the caller, and falls back to the peer address for any token that is absent,
+malformed, expired or forged.
+
+Regression guards, both of which fail against the token-keyed version
+(confirmed by reverting it — the quota test reports 11 allowed where 10 are
+intended):
+`test_rate_limit_bucket_is_the_account_not_the_token` alternates two genuine
+tokens for one account and asserts the 11th call is a 429;
+`test_unverified_token_cannot_choose_its_bucket` asserts a forged signature
+falls back to the address bucket.
+
+**Residual risk (filters on does NOT close this class):**
+
+- **A body with no `Content-Length` is refused rather than measured.** The
+  middleware decides from the declared length, so a chunked body-carrying request
+  gets the same 413 as an oversized one — "cannot tell" and "too large" are the
+  same answer, because the alternative is reading an unbounded stream to find
+  out. Correct for every client of this API, and it would reject a legitimate
+  streaming client. Counting bytes as they arrive is the upgrade.
+- **Fixed windows in a process-local dict.** A burst can straddle a window
+  boundary and get up to 2x the budget, and each worker keeps its own count, so
+  the effective limit scales with worker count. Correct bound for the
+  single-process laptop deployment this is; needs a shared store with a sliding
+  window otherwise.
+- **`request.client.host` is the peer, not `X-Forwarded-For`.** Deliberate —
+  reading a client-settable header would hand every caller its own bucket — but
+  behind a proxy every unauthenticated caller shares one bucket, which turns the
+  `/login` limit into a self-inflicted lockout. Needs trusted-proxy handling
+  before anything sits in front.
+- **A refused request is cheaper, not free.** Over the concurrency ceiling a
+  caller waits `GENERATION_WAIT_SECONDS` before the 503, and it waits holding a
+  threadpool worker. Enough callers past the ceiling therefore still occupy
+  capacity that endpoints doing no model work would want, and the rate limit —
+  which is per window, not per in-flight request — does not bound that. Lower
+  the wait toward zero to trade queueing for more 503s; the honest position is
+  that this bounds the *model* well and the *threadpool* only loosely.
+- **The single model instance is still an architectural ceiling.** With the loop
+  unblocked, output capped, and concurrency bounded, one local Ollama serving
+  sequentially means enough concurrent requests still queue behind each other.
+  A rate limit raises the bar; a single-laptop deployment can always be
+  saturated. The honest statement stays "much harder, not impossible."
+- **Detection is still blind.** Nothing above added a duration or token count to
+  `query.answered`, so the gap in the Detection section is unchanged for
+  *answered* requests. What is new is that refusals are visible: `limit.rate`,
+  `limit.generation` and `limit.body` events name the bucket, the caller and the
+  ceiling, so saturation now leaves a trace even though normal cost does not.

@@ -97,7 +97,7 @@ def answer_agentic(
                 page_content=hit["text"],
                 metadata={**hit["metadata"], "distance": hit["distance"]},
             )
-            chunk_flags = prompt_filter.screen_chunk(doc.page_content) if secure else []
+            chunk_flags = prompt_filter.screen_document(doc) if secure else []
             if chunk_flags:
                 flags.extend(chunk_flags)
                 audit_log.log(

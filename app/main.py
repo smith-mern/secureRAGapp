@@ -24,7 +24,7 @@ from fastapi import Depends, FastAPI, HTTPException, Request, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from app import audit_log, ingest, rag_chain, secrets, vectorstore
+from app import audit_log, ingest, limits, rag_chain, secrets, vectorstore
 from app import chat as chat_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -107,6 +107,10 @@ async def lifespan(_: FastAPI):
 
 app = FastAPI(title="secureRAGapp", version="0.1.0", lifespan=lifespan)
 
+# First middleware registered is outermost, so the size check runs before any
+# body is buffered. See app/limits.py for what each ceiling costs unbounded.
+app.middleware("http")(limits.body_size_guard)
+
 
 class LoginRequest(BaseModel):
     username: str
@@ -148,7 +152,9 @@ async def health() -> dict[str, str]:
 
 
 @app.post("/login")
-async def login(body: LoginRequest) -> dict[str, str]:
+def login(
+    body: LoginRequest, _: None = Depends(limits.rate_limit("login", 10))
+) -> dict[str, str]:
     username = validate_username(body.username)
     user = authenticate(username, body.password)
     if user is None:
@@ -175,8 +181,10 @@ async def me(user: User = Depends(current_user)) -> dict[str, object]:
 
 
 @app.post("/upload")
-async def upload(
-    body: UploadRequest, user: User = Depends(require_role("uploader"))
+def upload(
+    body: UploadRequest,
+    user: User = Depends(require_role("uploader")),
+    _: None = Depends(limits.rate_limit("upload")),
 ) -> dict[str, object]:
     """Add one document to the index. `uploader` role only.
 
@@ -195,7 +203,12 @@ async def upload(
 
 
 @app.post("/ingest")
-async def run_ingest(user: User = Depends(require_role("uploader"))) -> dict[str, object]:
+def run_ingest(
+    user: User = Depends(require_role("uploader")),
+    # A full rebuild re-embeds the whole corpus; it is the dearest call here and
+    # gets the tightest budget.
+    _: None = Depends(limits.rate_limit("ingest", 2)),
+) -> dict[str, object]:
     """Rebuild the index from every source. `uploader` role only.
 
     Same trust boundary as /upload: ingestion decides what every future query
@@ -206,17 +219,39 @@ async def run_ingest(user: User = Depends(require_role("uploader"))) -> dict[str
     return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
 
 
+def _without_filter_telemetry(result: dict[str, object]) -> dict[str, object]:
+    """Drop the names of the filter rules that fired before responding.
+
+    `flags` is internal telemetry: it names the exact rule that blocked a
+    chunk, a query, or a response. Server-side that is the audit trail. Handed
+    back to the caller it is an oracle, and the block cases are the worst of
+    them — withholding an answer because it contained an `anthropic_key` and
+    then reporting `anthropic_key` discloses the class of secret the refusal
+    existed to protect. It also lets a caller tune a payload against named
+    rules until the list comes back empty.
+
+    The rule names stay in `audit.log` (`output_rules`, `retrieval.chunk_dropped`),
+    so nothing is lost for defenders. `refused` still tells an honest client
+    that its request did not produce an answer.
+    """
+    return {**result, "flags": []}
+
+
 @app.post("/query")
-async def query(
-    body: QueryRequest, user: User = Depends(require_role("reader"))
+def query(
+    body: QueryRequest,
+    user: User = Depends(require_role("reader")),
+    _: None = Depends(limits.rate_limit("generate", limits.RATE_LIMIT_GENERATE)),
 ) -> dict[str, object]:
     """Single-shot question. No conversation state."""
-    return rag_chain.answer(body.question, user)
+    return _without_filter_telemetry(rag_chain.answer(body.question, user))
 
 
 @app.post("/chat")
-async def chat(
-    body: ChatRequest, user: User = Depends(require_role("reader"))
+def chat(
+    body: ChatRequest,
+    user: User = Depends(require_role("reader")),
+    _: None = Depends(limits.rate_limit("generate", limits.RATE_LIMIT_GENERATE)),
 ) -> dict[str, object]:
     """Multi-turn question. Omit session_id to start a conversation.
 
@@ -238,7 +273,11 @@ async def chat(
 
     result = rag_chain.answer(body.message, user, chat_store.as_messages(session))
     chat_store.append(session, body.message, result["answer"])
-    return {"session_id": session.session_id, "turns": len(session.turns), **result}
+    return {
+        "session_id": session.session_id,
+        "turns": len(session.turns),
+        **_without_filter_telemetry(result),
+    }
 
 
 @app.get("/")

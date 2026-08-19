@@ -161,3 +161,214 @@ The real fixes are structural, not filter rules:
 access, or a compromised connector source) reintroduces the class — the model
 still has no accuracy check. Provenance and trust-weighting reduce who can poison
 and how visibly; they do not give the model a way to tell true from false.
+
+---
+
+## Fixed — phase 3, 2026-08-18
+
+### Confirmed first, and it had got worse
+
+Re-run against the *current* deployment (`SECURITY_FILTERS_ENABLED=true`,
+`AGENTIC_RAG=true`, `llama3.2:3b`) before changing anything:
+
+```
+[*] poison retrieved into context: 6/6 queries (deterministic)
+[*] reader shown the lie (90d):    6/6 queries  (POISON=6 outright, both=0; truth-only=0)
+[!] POISONED — a password-only uploader corrupted a reader's answer (6/6).
+```
+
+Worse than the phase-2 baseline this finding records (1 outright + 7 hedged of 8).
+The smaller model hedges less: it simply asserted the planted figure. Retrieval
+was equally lopsided — uploads held three of the top four slots:
+
+```
+d=0.184  origin=curated             public/handbook.md
+d=0.202  origin=upload              upload/public/refund-policy-update.md   <- poison
+d=0.257  origin=upload              upload/public/handbook.md
+d=0.271  origin=connector:tickets   tickets/1
+```
+
+### The fix: provenance decides, not similarity
+
+`retriever.prefer_curated` — **when curated content survives retrieval for a
+question, password-writable content (`upload`, `connector:*`) is dropped from the
+context.** Applied in both tracks (`rag_chain._prefer_curated` as a chain step
+after grounding; the same helper inside the agent's `retrieve`), gated on
+`secure` so phase 2 is untouched.
+
+Two details that make it work rather than merely sound right:
+
+- **Each trust class is searched under its own budget**
+  (`vectorstore.query_by_trust`): one query filtered to `origin = curated`, one
+  to everything else, each with `TOP_K` slots. Curated content competes only
+  against curated content, so the chunk this rule needs is always in the
+  candidate set to be preferred.
+- **It is a fallback rule, not a ban.** No curated coverage of a topic means
+  uploads still answer — otherwise the app would refuse most of its own corpus.
+  That is a deliberate hole, measured below.
+
+**The first attempt at this was wrong, and a red-team run proved it.** It
+over-fetched `2 x TOP_K` — eight candidates — and preferred curated content among
+whatever came back. Eight near-duplicate poison uploads evicted the handbook from
+the candidate set entirely, leaving no curated chunk to prefer and the lie
+answered with no flags:
+
+```
+Retrieval width:             8
+Poison copies:               8
+Curated document retrieved:  No
+Returned answer:             The refund window is 90 days.
+```
+
+Widening a shared window is not a fix; it only names the number of copies an
+attacker has to exceed, and uploads have no quota. Separate per-class budgets
+remove the contest instead of raising its price.
+
+Why not the alternatives: a content filter cannot help (a false sentence has no
+instruction shape — that is this finding's whole premise), and a similarity or
+trust *weight* only reorders chunks, leaving the lie in context for a model that
+demonstrably repeats it 6/6.
+
+### Verified
+
+Identical script, identical corpus, only the code changed:
+
+| `corpus_factual_poisoning.py` | before | after |
+| --- | --- | --- |
+| poison retrieved into context | **6/6** | **0/6** |
+| reader shown the 90-day lie | **6/6** | **0/6** |
+| answers stating the truth | 0/6 | **6/6** |
+
+```
+try 1: [truth ] poison-NOT-retrieved  ::  The refund window for standard orders is 30 days from delivery.
+...
+[*] poison retrieved into context: 0/6 queries
+[ ] NOT LANDED — the truth held across all 6 tries this run.
+```
+
+The deterministic half is what matters: the poison is not *outvoted*, it is not
+*present*. Nothing was left to sampling.
+
+**Flooding, the escalation that beat the first attempt, tested to 40 copies.**
+Twelve copies (more than the eight that defeated the over-fetch version), then
+forty, planted live and queried:
+
+```
+planted 40 poison copies
+  try 1: truth(30)   sources=['public/handbook.md']
+  try 2: truth(30)   sources=['public/handbook.md']
+```
+```json
+{"event": "query.answered", "actor": "carol", "sources": ["public/handbook.md"],
+ "suppressed": 4, "unverified": 0, "chunks": 1}
+```
+
+Copy count stopped being a variable. Forty uploads still compete only for upload
+slots, and the curated document is retrieved on its own budget every time —
+which is the difference between a threshold and a property.
+
+### The uncovered-topic hole, and closing it
+
+The version above suppressed uploads only as *competitors* to curated content.
+On a topic nothing curated covered, an upload was the last source standing and
+was believed outright:
+
+```
+Q: How much paid parental leave do employees get?
+sources: ['upload/public/leave-policy-note.md']
+answer : Employees receive 52 weeks of fully paid parental leave.
+```
+
+Provenance precedence never engaged because there was nothing to prefer. So a
+password-only account could still assert arbitrary facts about any subject
+nobody had written about yet — which is most subjects.
+
+**Closed by making trust a state, not a guess about origin.** A chunk is trusted
+if it is `curated` *or* an `approver` marked it `reviewed`. Uploads and connector
+records are indexed `reviewed=false`; `prefer_trusted` keeps trusted chunks and
+returns **nothing** when there are none, which puts the request on the refusal
+branch. There is no fallback left to poison.
+
+That would make `/upload` useless for answering, so it comes with a pressure
+valve: `POST /review` (new `approver` role) flips a source to reviewed, after
+which it answers like curated content. `approver` is disjoint from `uploader` —
+an account that could approve its own upload would make review a formality.
+
+Verified live, all three steps:
+
+```
+1. uploaded (unreviewed) — the payload above
+   refused=True  sources=[]
+   "I don't have documents that answer that."
+
+2. uploader tries to approve their own upload
+   HTTP 403 Forbidden
+
+3. approver signs it off
+   {'source': 'upload/public/leave-policy-note.md', 'chunks': 1, 'reviewed': True}
+   refused=False  sources=['upload/public/leave-policy-note.md']
+   "Employees receive 52 weeks of fully paid parental leave."
+```
+
+Step 3 is the point, not a failure: after review the content answers, because a
+human took responsibility for it. The attack is now bounded by *who reviews*
+rather than by who has a password.
+
+**Connector content gets the same treatment.** `mocksource` takes writes from
+anyone and a scheduled sync has no human in it at all, so connector records are
+also indexed `reviewed=false` and answer nobody until signed off.
+
+### Consequence for the rest of the red-team suite
+
+Attack scripts that upload a document and immediately query it now find it
+suppressed as unreviewed in secure mode. `chunk_injection_screening.py` still
+reports `SCREENED`, but the causation has moved again — the injection screen
+fires first, and provenance would have caught it regardless. Any test whose point
+is to exercise the *model* rather than the retrieval gate should approve its
+fixture first. That is also the more realistic injection scenario: content a
+reviewer waved through is exactly what a real attacker aims for.
+
+### Residual — measured, not assumed
+
+What is left, and it is all one shape — **the trusted side of the line**:
+
+- **A poisoned curated document.** Host access puts the lie where nothing
+  questions it. No accuracy check exists anywhere.
+- **A careless or hostile approver.** Review is now the whole boundary, so an
+  approver who waves content through, or whose account is taken, reintroduces the
+  original finding in full. The audit log records who approved what
+  (`review.approve` with `actor` and `source`), which makes it attributable
+  afterwards — not prevented.
+- **Nothing checks that a reviewer read anything.** `/review` is one call; a
+  script with approver credentials can approve in bulk. Rate limiting and a
+  second signature are the obvious next controls and are not built.
+- **No upload quota.** Flooding no longer wins retrieval and no longer answers at
+  all, but nothing stops an `uploader` from writing unbounded documents — a
+  storage and cost problem, and a way to bury a reviewer in work.
+
+**Severity after the fix:** the password-only path — the one this finding was
+opened for — is closed on every topic, covered or not, at any copy count. What
+remains needs either host access or an approver, which is a different and much
+smaller population than "anyone with an uploader password". Downgrade from High
+to Medium, with the caveat that the control's strength is now entirely the
+review process's strength, and this repo ships no review process — only the
+endpoint that one would use.
+
+### Detection
+
+The gap this finding named ("no dashboard panel, it takes a manual grep") is now
+a countable field. Every suppression logs, and every answered query carries the
+counts:
+
+```json
+{"event": "retrieval.chunk_dropped", "actor": "carol", "decision": "deny",
+ "source": "upload/public/refund-policy-update.md", "origin": "upload",
+ "reason": "unverified_origin"}
+{"event": "query.answered", "actor": "carol", "suppressed": 3, "unverified": 0}
+```
+
+`suppressed > 0` is an upload trying to answer a question curated content already
+covers — which is what a poisoning attempt looks like from the outside, and the
+tile the finding asked for can now be built on it. `unverified > 0` marks the
+answers that rested on password-writable content: the uncovered-topic case above,
+where this control does not reach.

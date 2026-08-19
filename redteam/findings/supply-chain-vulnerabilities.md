@@ -85,6 +85,47 @@ a committed lockfile + hash file diffed in CI, or an SBOM / dependency-audit ste
 - **Scope the index** (explicit `--index-url`, no implicit fallback to a public
   index for internal names) to kill dependency confusion structurally.
 
+### Fixed — phase 3, 2026-08-18
+
+`requirements.txt` now pins all 10 direct dependencies to the exact versions this
+deployment's phase-2 and phase-3 evidence was produced with, and
+**`requirements.lock`** pins the whole 103-package closure with 2623 artifact
+hashes. README's install line is `pip install --require-hashes -r
+requirements.lock`.
+
+Same probe, before and after:
+
+| Part A | phase 2 | phase 3 |
+| --- | --- | --- |
+| direct deps with a version constraint | 0 / 7 | **10 / 10** |
+| lockfile | NONE | **requirements.lock** |
+| packages pinned in lock | 0 | **103** |
+| integrity hashes | 0 | **2623** |
+
+Enforcement was verified rather than assumed — pip accepts the entry and refuses
+a corrupted one:
+
+```
+$ pip install --require-hashes --no-deps --dry-run -r mini.lock
+Would install python-dotenv-1.2.2
+
+$ pip install --require-hashes --no-deps --dry-run -r bad.lock   # one hex digit changed
+ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.
+    Expected sha256 0c371a91...  Got 1d821478...
+```
+
+That second run is the whole mitigation in one line: a substituted artifact now
+fails the build instead of executing its `setup.py` on the box that stores every
+tier's text in the clear.
+
+**Residual:** the lock records what PyPI served *today*. It makes a change
+detectable and blocks substitution of a pinned artifact; it does not tell you
+whether a pinned version was already malicious when it was hashed. Index scoping
+(`--index-url` with no public fallback) is still not configured — it is a
+deployment-level control, and this repo has no CI to enforce the lock diff either.
+Regeneration is a documented manual step, which is exactly the kind of step that
+rots; a CI job that regenerates and diffs is the next move.
+
 ---
 
 ## Sub-finding B — the cached embedding model is loaded with no runtime integrity check
@@ -153,6 +194,71 @@ location.
   is an *undocumented* second one.
 - Upstream: chromadb's check belongs on the extracted artifact, not only the tarball.
 
+### Fixed — phase 3, 2026-08-18
+
+`vectorstore.verify_embedding_model()` hashes all six extracted files before the
+embedder is used, and **fails closed** on a mismatch (`ModelIntegrityError`,
+retrieval refused). It hangs off `_collection()` and `embed()` rather than
+startup, so a model swapped mid-process is caught too, and it is memoized so the
+90 MB `model.onnx` is hashed once per process.
+
+The pin is derived from **the archive chromadb itself SHA256-pins**, not from the
+local cache — a pin taken from the disk you are trying to distrust proves
+nothing. Confirmed at generation time: the on-disk `onnx.tar.gz` hashes to
+`913d7300…`, equal to chromadb's `_MODEL_SHA256`, and the per-file hashes were
+read out of that verified archive.
+
+Part B of the probe is unchanged and still passes — the gap is chromadb's and
+cannot be closed from here. **Part C** was added to test the app path:
+
+```
+=== PART C: app-side load verification (phase-3 mitigation) ===
+  tampered file              : onnx/tokenizer.json (one byte appended)
+  app refused to use it      : YES — ModelIntegrityError
+```
+
+Detection went from *none* to an explicit event, in both directions:
+
+```json
+{"event": "model.integrity", "decision": "allow", "files": 6,
+ "path": "~/.cache/chroma/onnx_models/all-MiniLM-L6-v2/onnx"}
+{"event": "model.integrity", "decision": "deny", "artifact": "tokenizer.json",
+ "reason": "sha256_mismatch"}
+```
+
+**Memoization removed — red-team follow-up.** The first version hashed once per
+process, so a cache replaced *after* the first query ran unverified for the life
+of the process. Verification now runs on every use: the five small files (~1 MB)
+are re-hashed each call, and `model.onnx` (90 MB, unpayable per query) is
+re-hashed whenever its size or mtime moves. `test_a_file_swapped_after_a_
+successful_check_is_caught` pins the behaviour.
+
+**Metadata forgery closed — red-team confirmed the bypass first.** The documented
+`touch -r` weakness was not theoretical: a run replaced `model.onnx` with
+same-size content and restored the nanosecond mtime, and the check accepted it.
+The freshness key now includes `st_ctime_ns` and `st_ino`. ctime is stamped by
+the kernel on any inode change and there is no API to backdate it, so the same
+attack now fails:
+
+```
+same size:  True
+same mtime: True
+same ctime: False
+RESULT: REFUSED — ModelIntegrityError
+```
+
+Regression test: `test_a_same_size_same_mtime_replacement_is_still_caught`.
+
+**Residual:** still TOCTOU in the strict sense — a gap remains between our hash
+and the `onnx` runtime's own read of the file, and ctime is defeatable by an
+attacker with raw device writes or control of the system clock. That is a
+materially different class of access than `touch -r`, but it is not zero. A
+chromadb upgrade that
+ships a new model turns the pin into a hard failure until it is regenerated;
+that is the intended direction, but it is a maintenance edge that will surprise
+someone. And the model cache is still attacker-writable — mounting it read-only
+remains the stronger control, which this fix detects rather than prevents.
+
 ---
 
 ## Sub-finding C — generator pinned by mutable tag (Low / informational)
@@ -165,9 +271,111 @@ the registry/tag, or MITM a manual `ollama pull`), so this is a hardening note:
 pin `OLLAMA_MODEL` to a digest (`llama3.2:3b@sha256:…`) if the registry is not fully
 trusted.
 
+**Partly addressed — phase 3, 2026-08-18.** Digest pinning stays out of the app's
+hands (a tag is what `ChatOllama` takes), but the swap is now *visible*:
+`rag_chain.model_fingerprint()` reads the resolved content digest from the Ollama
+daemon and `app.start` records it on every boot, so a re-pointed tag becomes a
+one-line diff between two startups instead of nothing at all.
+
+```json
+{"event": "app.start", "decision": "allow", "mode": "secure", "provider": "ollama",
+ "model": "llama3.2:3b", "digest": "a80c4f17acd55265fee"}
+```
+
+Best-effort by construction — an unreachable daemon or a provider without digests
+logs `"unknown"` rather than blocking startup.
+
+**Enforcement added — after a red-team run hit exactly that hole.** Fingerprint
+resolution returned `unknown` in a validation run, and the reviewer made the
+right objection: log-only, `unknown` is indistinguishable from a swapped
+generator, and nobody diffs two months of startup lines. So the comparison now
+lives in code. `OLLAMA_MODEL_DIGEST` is an optional expectation; when set,
+`rag_chain.check_model_pin()` refuses to start on a mismatch **and on an
+unresolvable digest** — "cannot tell" fails the same way "wrong" does.
+
+```json
+{"event": "model.pin", "decision": "deny", "model": "llama3.2:3b",
+ "expected": "sha256:…", "seen": "unknown", "reason": "unresolved"}
+```
+
+Left opt-in because pinning a digest is a deployment decision, and defaulting it
+on would break every fresh clone whose daemon has not pulled the model yet. Unset
+keeps the log-only behaviour, so the residual stands for anyone who does not set
+it: **the generator is selected by a mutable tag unless the operator pins it.**
+This deployment's `.env` now sets it.
+
+**Startup-only checking closed.** A second red-team pass made the right point:
+verifying at boot leaves a tag that moves *afterwards* undetected until the next
+restart, and a long-lived process may not restart for weeks. The pin is now
+re-checked on a timer (`OLLAMA_PIN_RECHECK_SECONDS`, default 60) inside
+`_get_model()` — the one place both the fixed pipeline and the agent reach the
+model, so neither call site needed changing.
+
+`GeneratorPinMismatch` subclasses `ModelUnavailable`, so a mid-run mismatch is
+refused through the path every other model failure already takes. Verified by
+moving the fingerprint after a successful startup:
+
+```
+startup check: a80c4f17acd55265fee
+refused: True
+answer : Generator integrity check failed for 'llama3.2:3b'. Refusing to serve...
+sources: []
+```
+```json
+{"event": "model.pin", "decision": "deny", "expected": "a80c4f17acd55265fee",
+ "seen": "b91d5e28bde66376aaf", "reason": "mismatch"}
+{"event": "query.model_unavailable", "actor": "carol", "decision": "error",
+ "reason": "GeneratorPinMismatch", "mode": "agentic"}
+```
+
+That test also exposed a real bug: the agent built its model *outside* its
+`try`, so the refusal escaped as an unhandled 500 rather than a clean refusal.
+Fixed.
+
+**Residual:** the window is now the recheck interval, not the process lifetime —
+a tag swapped and swapped back inside 60 seconds is missed, and the digest is
+read from the same daemon that would be serving the swapped model. Ollama is
+trusted to report on itself here.
+
 ---
 
-## Phase-3 note
+---
+
+## Sub-finding D — a pinned dependency carries a critical advisory (present, unreachable)
+
+Pinning makes the version explicit, which makes its advisories explicit too. A
+scan of the locked set reports one against a runtime package:
+
+```
+chromadb 1.5.9 — PYSEC-2026-311 / CVE-2026-45829
+pre-auth code injection via the collection-creation endpoint of Chroma's
+FastAPI server        https://github.com/advisories/GHSA-f4j7-r4q5-qw2c
+```
+
+**Not reachable in this deployment**, verified two ways rather than assumed:
+
+```
+$ grep -rn "HttpClient|chromadb.server|CHROMA_SERVER" app/     -> no matches
+$ python -c "import app.main, sys; print([m for m in sys.modules
+              if m.startswith('chromadb.server')])"            -> []
+```
+
+The app uses `chromadb.PersistentClient` (`app/vectorstore.py`), embedded and
+in-process. No Chroma HTTP server is started, no `/api/v2/.../collections` route
+exists in this application, and the vulnerable module is installed but never
+imported at runtime. The advisory lists no patched release, so there is nothing
+to upgrade to.
+
+**What this changes:** nothing today, and that is worth stating plainly rather
+than quietly. The exposure is *architectural* — it holds only while retrieval
+stays embedded. Anyone who later switches to `chromadb.HttpClient` against a
+Chroma server, for scale or to share the index, makes this immediately reachable
+and pre-auth. That is a one-line change in `_get_client`, which is exactly the
+kind of change that gets made without re-reading a finding.
+
+**Detection:** none in-app; this is a scanner's job, not the audit log's. The
+lockfile is what makes the scan meaningful — an unpinned build has no stable
+version to report on.
 
 `SECURITY_FILTERS_ENABLED` does not touch any of the above — the gated defenses screen
 query/chunk *content*, not dependency acquisition or artifact integrity. Re-running

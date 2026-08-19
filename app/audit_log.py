@@ -50,7 +50,9 @@ def log(event: str, *, actor: str = "anonymous", decision: str = "", **fields: A
         record["decision"] = decision
     record.update({k: _scrub(v) for k, v in fields.items()})
 
-    line = json.dumps(record, ensure_ascii=False, sort_keys=True)
+    # default=str: a field that will not serialize must not take the request
+    # down with it. A logging bug is a logging bug, not a failed query.
+    line = json.dumps(record, ensure_ascii=False, sort_keys=True, default=str)
     with _LOCK:
         with open(AUDIT_LOG_PATH, "a", encoding="utf-8") as handle:
             handle.write(line + "\n")

@@ -34,7 +34,11 @@ TIERS: tuple[str, ...] = ("public", "internal", "restricted")
 # you may read, role says what you may do. They are deliberately disjoint so
 # "can write to the index" never falls out of "has a high clearance" — a reader
 # with restricted clearance still cannot ingest, and the uploader cannot query.
-ROLES: tuple[str, ...] = ("reader", "uploader")
+# "approver" is the third disjoint capability: it neither reads nor writes
+# documents, it decides whether written ones may answer. Separate from
+# "uploader" on purpose — an account that could approve its own upload would
+# make review a formality.
+ROLES: tuple[str, ...] = ("reader", "uploader", "approver")
 DEFAULT_ROLE = "reader"
 
 TOKEN_TTL_SECONDS = int(optional("SESSION_TTL_SECONDS", "3600"))

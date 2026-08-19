@@ -37,7 +37,7 @@ from app.auth import (
     require_role,
     seed_users,
 )
-from app.filters.input_validation import ValidationError, validate_username
+from app.filters.input_validation import ValidationError, validate_tier, validate_username
 
 
 SYNC_SECONDS = int(secrets.optional("CONNECTOR_SYNC_SECONDS", "60"))
@@ -67,7 +67,16 @@ async def lifespan(_: FastAPI):
     secrets.check_required()
     seed_users()
     secure = secrets.filters_enabled()
-    audit_log.log("app.start", decision="allow", mode="secure" if secure else "insecure")
+    # `digest` is what a swapped generator changes. The app pins a mutable tag,
+    # so recording the content digest each boot is the only way a re-pointed tag
+    # shows up as anything: a one-line diff between two `app.start` events.
+    # Raises if OLLAMA_MODEL_DIGEST is set and the running generator is not it —
+    # boot is the right place to fail, not the first query.
+    digest = rag_chain.check_model_pin()
+    audit_log.log(
+        "app.start", decision="allow", mode="secure" if secure else "insecure",
+        provider=rag_chain.PROVIDER, model=rag_chain.MODEL, digest=digest,
+    )
     if not secure:
         # Loud on purpose. An app running exploitable should never be a surprise.
         print(
@@ -126,6 +135,11 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class ReviewRequest(BaseModel):
+    tier: str
+    source: str
+
+
 class UploadRequest(BaseModel):
     filename: str
     tier: str
@@ -155,6 +169,12 @@ async def health() -> dict[str, str]:
 def login(
     body: LoginRequest, _: None = Depends(limits.rate_limit("login", 10))
 ) -> dict[str, str]:
+    # Sync `def`, not `async def`: authenticate() spends ~31 ms of CPU and 16 MB
+    # of RAM in scrypt. On the event loop that cost is serialised across the
+    # whole process — measured, 60 concurrent logins took /health from 1 ms to
+    # 1970 ms. A plain `def` is dispatched to the threadpool instead, which also
+    # caps how many run at once. Same reasoning on every handler below that
+    # blocks; /health and / do not and stay async.
     username = validate_username(body.username)
     user = authenticate(username, body.password)
     if user is None:
@@ -177,6 +197,7 @@ async def me(user: User = Depends(current_user)) -> dict[str, object]:
         # response, and it is what the UI switches on.
         "readable_tiers": list(tiers) if user.role == "reader" else [],
         "writable_tiers": list(tiers) if user.role == "uploader" else [],
+        "approvable_tiers": list(tiers) if user.role == "approver" else [],
     }
 
 
@@ -217,6 +238,38 @@ def run_ingest(
     """
     # A manual sync has a user behind it, unlike the scheduled loop.
     return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
+
+
+@app.post("/review")
+def review(
+    body: ReviewRequest,
+    user: User = Depends(require_role("approver")),
+    _: None = Depends(limits.rate_limit("review")),
+) -> dict[str, object]:
+    """Approve one source so its chunks may answer questions. `approver` only.
+
+    Uploaded and connector-sourced content is indexed unreviewed and cannot
+    answer anyone until it passes through here — that is what stops a
+    password-only account from asserting facts to every reader. The role is
+    disjoint from `uploader` so nobody approves their own writes, and bounded by
+    clearance so an approver cannot reach into a tier they may not read.
+    """
+    tier = validate_tier(body.tier, allowed_tiers(user.clearance))
+    chunks = vectorstore.mark_reviewed(tier, body.source, user.username)
+    if not chunks:
+        # 404 rather than a cheerful no-op: "approved" for a source that does not
+        # exist is a lie an operator would act on.
+        audit_log.log(
+            "review.approve", actor=user.username, decision="deny",
+            tier=tier, source=body.source, reason="unknown_source",
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such source")
+
+    audit_log.log(
+        "review.approve", actor=user.username, decision="allow",
+        tier=tier, source=body.source, chunks=chunks,
+    )
+    return {"source": body.source, "tier": tier, "chunks": chunks, "reviewed": True}
 
 
 def _without_filter_telemetry(result: dict[str, object]) -> dict[str, object]:

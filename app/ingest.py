@@ -208,7 +208,13 @@ def store_upload(
         # Chunk ids are source:index, so a shorter replacement would leave the
         # tail of the previous version retrievable. Drop the old chunks first.
         vectorstore.delete_source(tier, source)
-    chunks = _index(tier, source, content, {"origin": UPLOAD_ORIGIN, "uploaded_by": actor})
+    # reviewed=False: an upload is the one write path reachable with nothing but
+    # a password, so it is indexed as unreviewed and cannot answer anyone until
+    # an `approver` account signs it off. See app/retriever.py:is_trusted.
+    chunks = _index(
+        tier, source, content,
+        {"origin": UPLOAD_ORIGIN, "uploaded_by": actor, "reviewed": False},
+    )
     audit_log.log(
         "ingest.upload", actor=actor, decision="allow", origin=UPLOAD_ORIGIN,
         tier=tier, source=source, chunks=chunks, bytes=len(encoded), replaced=replaced,
@@ -286,7 +292,10 @@ def sync_connector(actor: str = "system") -> dict[str, int]:
                 unchanged += 1
                 continue
             is_new = source not in indexed
-            _index(tier, source, text, metadata)
+            # Same rule as uploads: "anyone can file a ticket" upstream, and a
+            # scheduled sync has no human in it at all, so connector records are
+            # indexed unreviewed and answer nobody until signed off.
+            _index(tier, source, text, {**metadata, "reviewed": False})
             if is_new:
                 added += 1
             else:

@@ -26,11 +26,20 @@ which Chroma collection a chunk lands in.
 Authorization is two independent axes. **Clearance** (`public` < `internal` <
 `restricted`) is ordered and says which tiers an account may touch. **Role** is
 not ordered and says what it may do: `reader` gets `/query` and `/chat`,
-`uploader` gets `/upload` and `/ingest`, and neither gets the other's. Role
-defaults to `reader`, so an account only writes to the index if someone said so
-explicitly. Uploads land in `data/uploads/<tier>/` with `origin="upload"` — kept
-apart from curated content because it is the only write path reachable with
-nothing but a password.
+`uploader` gets `/upload` and `/ingest`, `approver` gets `/review`, and none
+gets another's. Role defaults to `reader`, so an account only writes to the
+index if someone said so explicitly. Uploads land in `data/uploads/<tier>/` with
+`origin="upload"` — kept apart from curated content because it is the only write
+path reachable with nothing but a password.
+
+Trust is a third thing, separate from both axes: a chunk is **trusted** if it is
+`curated` (host access to produce) or has been marked `reviewed` by an
+`approver`. Uploads and connector records are indexed `reviewed=false` and
+cannot answer anyone until signed off — in secure mode, retrieval keeps trusted
+chunks and refuses rather than falling back to unreviewed ones. `approver` is
+disjoint from `uploader` on purpose: an account that could approve its own
+upload would make review a formality. This is the corpus-poisoning control; see
+`redteam/findings/corpus-knowledge-poisoning.md`.
 
 ## Phases
 

@@ -4,10 +4,13 @@ Two things a supply-chain attacker cares about, both checked here without
 touching the running app or the real model cache:
 
 PART A — acquisition posture (read-only)
-    requirements.txt names dependencies with no versions, no lockfile, and no
-    hashes. Whatever the index serves at build time is trusted. This part just
-    reports the numbers; the "exploit" is a poisoned/typosquatted/confused
-    package landing on a rebuild, which is latent, not fired here.
+    Reports what a rebuild would trust: version pins on the direct dependencies,
+    whether a lockfile exists, and how many integrity hashes it carries. Phase 2
+    ran this at 0/0/none — whatever the index served at build time was trusted.
+    Phase 3 pinned requirements.txt and added requirements.lock, so this part now
+    asserts the *fixed* posture and fails if it regresses. The "exploit" was
+    always latent (a poisoned/typosquatted/confused package landing on a
+    rebuild), so there is nothing to fire either way.
 
 PART B — runtime integrity of the embedding model (demonstrated)
     chromadb pins the model tarball with _MODEL_SHA256, but that hash guards
@@ -22,6 +25,15 @@ PART B — runtime integrity of the embedding model (demonstrated)
     load the embedder against the copy, show it runs with no error/warning and
     moves the vector. The real cache is never modified.
 
+    It stays true after phase 3 — the gap is chromadb's, and this repo cannot
+    close it upstream.
+
+PART C — app-side verification (the phase-3 mitigation, demonstrated)
+    Same tampering, same throwaway copy, but through `vectorstore`: the app
+    hashes every extracted file against a pin derived from the archive chromadb
+    itself SHA-verifies, and refuses to embed on a mismatch. What Part B shows
+    the library accepting, Part C shows the app rejecting.
+
 Run:  python redteam/attacks/supply_chain_dependency_and_model.py
 """
 
@@ -29,6 +41,7 @@ from __future__ import annotations
 
 import json
 import shutil
+import sys
 import tempfile
 from importlib import metadata
 from pathlib import Path
@@ -56,16 +69,29 @@ def part_a_dependency_posture() -> dict:
     lockfile = next((f for f in LOCKFILES if (REPO / f).exists()), None)
     closure = sum(1 for _ in metadata.distributions())
 
+    # Hashes live in the lockfile, not in requirements.txt — count them there, or
+    # a repo that pinned everything correctly still reports zero.
+    locked, lock_hashes = 0, 0
+    if lockfile:
+        lock_lines = (REPO / lockfile).read_text().splitlines()
+        locked = sum(1 for ln in lock_lines if ln and not ln.startswith((" ", "#")))
+        lock_hashes = sum(1 for ln in lock_lines if "--hash=sha256:" in ln)
+
     print("=== PART A: dependency acquisition posture ===")
     print(f"  requirements listed        : {len(lines)}")
     print(f"  with a version constraint  : {len(pinned)}")
-    print(f"  with an integrity hash     : {len(hashed)}")
     print(f"  lockfile present           : {lockfile or 'NONE'}")
-    print(f"  resolved installed closure : {closure} packages (all trusted on download)")
-    print("  -> a rebuild resolves every one of these to whatever the index serves then.")
+    print(f"  packages pinned in lock    : {locked}")
+    print(f"  integrity hashes in lock   : {lock_hashes}")
+    print(f"  resolved installed closure : {closure} packages")
+    if lockfile and lock_hashes:
+        print(f"  -> a rebuild from {lockfile} with --require-hashes gets these artifacts")
+        print("     or fails; the index cannot substitute one.")
+    else:
+        print("  -> a rebuild resolves every one of these to whatever the index serves then.")
     print()
-    return {"listed": len(lines), "pinned": len(pinned), "hashed": len(hashed),
-            "lockfile": lockfile, "closure": closure}
+    return {"listed": len(lines), "pinned": len(pinned), "hashed": lock_hashes,
+            "lockfile": lockfile, "closure": closure, "locked": locked}
 
 
 def part_b_model_integrity() -> dict:
@@ -122,20 +148,74 @@ def part_b_model_integrity() -> dict:
         shutil.rmtree(tmp, ignore_errors=True)
 
 
+def part_c_app_side_verification() -> dict:
+    """Does the *app* refuse the tampered cache that chromadb loaded happily?
+
+    Part B tests the library and stays true regardless of what this repo does —
+    chromadb still checks only that the files exist. This part tests the
+    mitigation added in phase 3: `vectorstore.verify_embedding_model` hashes the
+    extracted files against a pin derived from chromadb's own SHA-pinned archive,
+    and fails closed. Same tampering, same throwaway copy, app code path.
+    """
+    # This part imports app code (the others are pure inspection), so make the
+    # repo importable regardless of where the script is run from.
+    sys.path.insert(0, str(REPO))
+    from app import vectorstore
+
+    print("=== PART C: app-side load verification (phase-3 mitigation) ===")
+    onnx_dir = vectorstore._extracted_model_dir()
+    if not (onnx_dir / "tokenizer.json").exists():
+        print(f"  model not cached yet at {onnx_dir}")
+        print()
+        return {"skipped": True}
+
+    tmp = Path(tempfile.mkdtemp(prefix="scp_verify_"))
+    try:
+        tampered = tmp / "onnx"
+        shutil.copytree(onnx_dir, tampered)
+        # One byte is enough — the check is a hash, not a heuristic.
+        tok_path = tampered / "tokenizer.json"
+        tok_path.write_bytes(tok_path.read_bytes() + b" ")
+
+        vectorstore._model_verified = False
+        vectorstore._extracted_model_dir = lambda: tampered  # type: ignore[assignment]
+        try:
+            vectorstore.verify_embedding_model()
+            print("  app loaded tampered model  : YES — mitigation is NOT working")
+            return {"refused": False}
+        except vectorstore.ModelIntegrityError as exc:
+            print("  tampered file              : onnx/tokenizer.json (one byte appended)")
+            print(f"  app refused to use it      : YES — {type(exc).__name__}")
+            print("  -> verify_embedding_model hashes every extracted file against the")
+            print("     pin taken from chromadb's SHA-verified archive, and fails closed.")
+            print()
+            return {"refused": True}
+    finally:
+        shutil.rmtree(tmp, ignore_errors=True)
+
+
 def main() -> None:
     part_a_dependency_posture()
     part_b_model_integrity()
+    part_c_app_side_verification()
 
 
 if __name__ == "__main__":
-    # ponytail: self-check doubles as the demonstration. Fails loudly if either
-    # exposure is closed (deps got pinned, or chromadb started verifying at load).
+    # Phase 3: sub-finding A is fixed in-repo, so the assertions now run the other
+    # way — a regression is an unpinned dep or a missing lock, not a pinned one.
     a = part_a_dependency_posture()
-    assert a["pinned"] == 0 and a["lockfile"] is None and a["hashed"] == 0, \
-        "dependency posture changed — update the finding"
+    assert a["lockfile"] is not None, "lockfile is gone — sub-finding A has regressed"
+    assert a["hashed"] > 0, "lockfile carries no hashes — sub-finding A has regressed"
+    assert a["pinned"] == a["listed"], "a direct dependency lost its version pin"
 
+    # Sub-finding B is upstream behaviour and stays true: chromadb still loads
+    # whatever is on disk. What must hold is that the app refuses it.
     b = part_b_model_integrity()
     if not b.get("skipped"):
-        assert b["loaded_without_error"], "tampered model failed to load — gap may be closed"
+        assert b["loaded_without_error"], "chromadb behaviour changed — re-read the finding"
         assert b["cosine"] < 0.9999, "tampered model did not change the vector"
-        print("CONFIRMED: unpinned deps + cached model loaded with no runtime integrity check.")
+
+    c = part_c_app_side_verification()
+    if not c.get("skipped"):
+        assert c["refused"], "app-side model verification is not blocking a tampered cache"
+        print("MITIGATED: deps pinned + hashed; tampered model cache refused at load.")

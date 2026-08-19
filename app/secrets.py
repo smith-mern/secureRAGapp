@@ -80,8 +80,8 @@ def agentic_enabled() -> bool:
     """Whether the model drives retrieval as a tool (agentic RAG).
 
     Defaults to FALSE, so the phase-2/3 pipeline is unchanged unless asked for.
-    Reliable only on a tool-calling provider (Groq); the local 12B mostly does
-    not tool-call. Read at call time, like `filters_enabled`.
+    Needs a tool-calling model: Groq's 70B and the local llama3.2:3b both do.
+    Read at call time, like `filters_enabled`.
     """
     return os.environ.get("AGENTIC_RAG", "false").strip().lower() in (
         "1", "true", "yes", "on",

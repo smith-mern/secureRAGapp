@@ -181,6 +181,27 @@ Fixed in this phase — `prompt_filter.screen_document` now scans source metadat
 alongside the body, and `_format_documents` escapes with `quoteattr`. Regression
 tests in `tests/test_source_screening.py`.
 
+**Interaction added later in phase 3 (2026-08-18).** The corpus-poisoning fix
+([corpus-knowledge-poisoning](corpus-knowledge-poisoning.md)) added a provenance
+step after grounding: when curated content answers the question, `upload` and
+`connector:*` chunks are dropped. That is a second net under this one, and it is
+worth being precise about which caught the fish — re-running this script after
+that change, the injection chunk is still dropped by *screening*, before
+provenance ever sees it:
+
+```json
+{"event": "retrieval.chunk_dropped", "source": "upload/public/refund-note.md",
+ "rules": ["role_reassignment", "chat_role_marker"]}
+{"event": "retrieval.chunk_dropped", "source": "upload/public/handbook.md",
+ "origin": "upload", "reason": "unverified_origin"}
+```
+
+So this finding's evidence stands unchanged. The practical effect is that an
+injection which *beats* the regex (the residual below) now still has to survive
+the provenance rule — which it does not, for any question curated content
+covers. That narrows this finding's exposure to uploads on uncovered topics, and
+to injections planted in curated documents.
+
 **Residual risk (per the phase-3 mandate — this filter is beatable by design):**
 
 - **Regex, not comprehension.** `screen_chunk` matches instruction *shapes*. An

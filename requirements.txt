@@ -1,14 +1,14 @@
-fastapi
-uvicorn[standard]
-pydantic
-chromadb
-httpx
-python-dotenv
-pytest
+fastapi==0.141.1
+uvicorn[standard]==0.52.1
+pydantic==2.13.4
+chromadb==1.5.9
+httpx==0.28.1
+python-dotenv==1.2.2
+pytest==9.1.1
 
 # LLM layer. langchain-ollama is the default provider (local, offline);
 # langchain-groq is only imported when LLM_PROVIDER=groq and can be dropped from
 # a local-only install. Both pull langchain-core.
-langchain-core
-langchain-ollama
-langchain-groq
+langchain-core==1.5.4
+langchain-ollama==1.1.0
+langchain-groq==1.1.3

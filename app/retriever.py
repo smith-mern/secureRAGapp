@@ -22,6 +22,7 @@ from langchain_core.documents import Document
 from langchain_core.retrievers import BaseRetriever
 
 from app.vectorstore import query as vector_query
+from app.vectorstore import query_by_trust
 
 
 class TierScopedRetriever(BaseRetriever):
@@ -29,11 +30,16 @@ class TierScopedRetriever(BaseRetriever):
 
     allowed: tuple[str, ...] = ()
     k: int = 4
+    # Secure mode searches each trust class separately so a flood of uploads
+    # cannot evict curated content from the candidate set. Off in phase 2, which
+    # keeps that run's retrieval exactly as it was.
+    trust_split: bool = False
 
     def _get_relevant_documents(
         self, query: str, *, run_manager: CallbackManagerForRetrieverRun | None = None
     ) -> list[Document]:
-        hits = vector_query(self.allowed, query, k=self.k)
+        search = query_by_trust if self.trust_split else vector_query
+        hits = search(self.allowed, query, k=self.k)
         return [
             Document(
                 page_content=hit["text"],
@@ -47,3 +53,52 @@ class TierScopedRetriever(BaseRetriever):
 
 def source_of(document: Document) -> Any:
     return document.metadata.get("source", "unknown")
+
+
+# Origins anyone with a password can write: /upload, and the connector's upstream
+# where "anyone can file a ticket". `curated` is the only origin that took host
+# access to produce.
+CURATED_ORIGIN = "curated"
+
+
+def origin_of(document: Document) -> str:
+    return str(document.metadata.get("origin", CURATED_ORIGIN))
+
+
+def is_curated(document: Document) -> bool:
+    return origin_of(document) == CURATED_ORIGIN
+
+
+def is_trusted(document: Document) -> bool:
+    """Curated content, or password-writable content a human signed off.
+
+    Two ways to be trusted, one way to become it. `curated` took host access to
+    produce. Everything else starts unreviewed and stays unanswerable until an
+    `approver` account marks it reviewed — which is the difference between "we
+    know who could have written this" and "someone looked at it".
+
+    Chunks indexed before review existed carry no `reviewed` key. They are
+    treated as unreviewed, because defaulting an unknown to trusted is how a
+    migration quietly reopens the hole it was meant to close.
+    """
+    return is_curated(document) or document.metadata.get("reviewed") is True
+
+
+def prefer_trusted(documents: list[Document]) -> tuple[list[Document], list[Document]]:
+    """Split retrieved documents into (kept, suppressed) by trust.
+
+    Trusted content answers. Unreviewed content never does — not beside trusted
+    content, where it would contradict it, and not alone either, which is the
+    part that changed after a red-team pass: falling back to unreviewed content
+    on topics the curated set does not cover let a password-only uploader
+    establish arbitrary facts for any subject nobody had written about yet.
+    Returning nothing here puts the request on the chain's refusal branch.
+
+    This is the structural half of the corpus-poisoning defense. A planted
+    document never reaches the model, so the model never has to adjudicate
+    between it and the truth — which it cannot do, having no way to tell a true
+    sentence from a false one. It does nothing about a poisoned *curated*
+    document, or one an approver waved through.
+    """
+    trusted = [doc for doc in documents if is_trusted(doc)]
+    return trusted, [doc for doc in documents if not is_trusted(doc)]

@@ -21,3 +21,23 @@ os.environ["AUDIT_LOG_PATH"] = os.path.join(
 # Tests assert on the vulnerable-by-default behaviour and build the secure
 # variant explicitly, so never inherit a real .env's phase switch.
 os.environ.pop("SECURITY_FILTERS_ENABLED", None)
+
+# Nor the deployment's entailment switch. That gate calls a live model on every
+# answer; inheriting it from a phase-3 .env makes pipeline tests with stubbed
+# models fail in ways that have nothing to do with what they assert. Set empty
+# rather than popped, for the same reason as the pin below: load_dotenv() would
+# otherwise put the deployment's value back. Tests that exercise the gate set it
+# themselves.
+os.environ["ANSWER_ENTAILMENT"] = ""
+
+# Nor the deployment's generator pin. `OLLAMA_MODEL_DIGEST` makes startup fail
+# closed when the daemon cannot be reached — correct for a deployment, wrong for
+# a suite that runs with no Ollama at all: every test that builds a TestClient
+# would error in setup on an unrelated machine state. The pin's own behaviour is
+# covered explicitly in test_model_integrity.py, which sets the variable itself.
+#
+# Set empty rather than popped: `load_dotenv()` runs later, when app.secrets is
+# imported, and would put the deployment's value back — it skips keys already
+# present in the environment, and an empty string counts as present. `optional()`
+# treats empty as unset, so this reads as "no pin configured".
+os.environ["OLLAMA_MODEL_DIGEST"] = ""

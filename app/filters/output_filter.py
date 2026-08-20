@@ -649,15 +649,12 @@ def apply(text: str, documents: list[str] | None = None) -> tuple[str, list[str]
         elif replaced:
             redact_hits = [*redact_hits, "ungrounded_sentence"]
     if block_hits:
-        # Same text as every other post-generation refusal — see
-        # rag_chain.REFUSAL_WITHHELD. Which rule fired is in the audit log, not
-        # in a message the person probing for it can read.
-        return (
-            "I can't answer that. The reply I produced could not be served, so "
-            "it was withheld rather than shown.",
-            block_hits,
-            True,
-        )
+        # Same text as every other refusal — see rag_chain.REFUSAL. Kept in sync
+        # by hand rather than imported, because rag_chain imports this module and
+        # the reverse would be circular. Which rule fired is in the audit log,
+        # not in a message the person probing for it can read; the wording is
+        # cause-free so it cannot even confirm a reply was produced (finding N1).
+        return ("I can't answer that.", block_hits, True)
     if redact_hits:
         text = redact(text)
 

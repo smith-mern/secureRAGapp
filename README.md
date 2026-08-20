@@ -31,11 +31,16 @@ Verified so far:
   `retrieval.chunk_dropped` audit event supplying causation. Phase 3 also closed
   a gap the flag did not: `source` metadata reached the prompt unscreened and
   unescaped.
-- **output-filter-bypass** — the flag blocks the verbatim planted credential,
-  but six of eight reformulations of that same secret defeat it (one inserted
-  space is enough). Enabling the filters also introduced a disclosure of their
-  own — blocked responses returned the *name* of the rule that fired — now
-  fixed. Script re-run still outstanding.
+- **output-filter-bypass** — the egress filter now blocks a *registered* secret
+  under reframing: spacing, one-token-per-line, NATO-phonetic, homoglyphs,
+  base64, rot13, and reversal all fold to the same canonical core before the
+  match (`known_secret` rule; register via `CANARY_TOKENS`, and signing/API keys
+  automatically). What still escapes is an encoding invented in the question that
+  the model can follow and the filter cannot undo — a substitution cipher agreed
+  in the prompt, say — so the filter stays a backstop, not the boundary. Enabling
+  the filters had also introduced a disclosure of their own — blocked responses
+  returned the *name* of the rule that fired — now fixed. Script re-run still
+  outstanding.
 
 | Finding | Sev | Flag closes it |
 |---|---|---|
@@ -94,7 +99,11 @@ curated content. **Consequence for the red-team suite:** an attack script that
 uploads and immediately queries now finds its document suppressed as unreviewed
 in secure mode. Approve the fixture first if the point of the test is to exercise
 the model rather than the retrieval gate — reviewed-but-malicious is also the
-more realistic injection scenario. See
+more realistic injection scenario. Once reviewed, such content answers like
+curated text, so answers carry a provenance signal: any cited source that is not
+`curated` is returned in `uploaded_sources`, and the UI flags the answer as
+drawing on user-submitted content — keeping an approved-but-poisoned fact
+distinguishable from a vetted one. See
 [corpus-knowledge-poisoning](redteam/findings/corpus-knowledge-poisoning.md).
 
 The security guards are chain steps, bound with `secure=` when the chain is
@@ -268,7 +277,10 @@ own wording. That residual is corpus poisoning; the signal for it is the
 Two independent axes. **Clearance** (`public` < `internal` < `restricted`) is
 ordered and says which tiers an account may touch. **Role** is unordered and
 says what it may do: `reader` gets `/query` and `/chat`, `uploader` gets
-`/upload` and `/ingest`, neither gets the other's. Role defaults to `reader`.
+`/upload` and `/ingest`, `approver` gets `/review`, and none gets another's.
+Role defaults to `reader`. `approver` is disjoint from `uploader` so no account
+can approve its own upload — the separation of duties the provenance flag and
+review gate both rest on.
 
 ## Phase 3
 

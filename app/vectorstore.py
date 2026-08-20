@@ -28,7 +28,7 @@ from typing import Any, Iterable
 
 import chromadb
 
-from app import audit_log
+from app import audit_log, crypto
 from app.secrets import CHROMA_DIR
 
 # Cosine keeps distances in a comparable 0..2 range across collections, which
@@ -189,6 +189,19 @@ def _get_client() -> chromadb.ClientAPI:
     global _client
     if _client is None:
         CHROMA_DIR.mkdir(parents=True, exist_ok=True)
+        # Owner-only. The store holds every tier's text in the clear, and the
+        # default 022 umask leaves it 0755/0644 — world-readable, which makes
+        # "read restricted content" a `cat` for any local account. chmod runs on
+        # every client build, not just on create, so an already-permissive store
+        # is tightened rather than inherited.
+        #
+        # This narrows the exposure to the owning user; it does not close it.
+        # Same-user access, backups, and anything that copies the directory are
+        # untouched, and encryption at rest is the control that would matter
+        # there. See redteam/findings/vectorstore-no-access-control.md.
+        # ponytail: directory mode only — 0700 blocks traversal, so per-file
+        # modes inside are moot for a different-user attacker.
+        CHROMA_DIR.chmod(0o700)
         _client = chromadb.PersistentClient(path=str(CHROMA_DIR))
     return _client
 
@@ -222,15 +235,112 @@ def add_chunks(tier: str, chunks: Iterable[tuple[str, str, dict[str, Any]]]) -> 
     for chunk_key, text, metadata in chunks:
         ids.append(chunk_key)
         documents.append(text)
-        metadatas.append({**metadata, "tier": tier})
+        metadatas.append(_seal_metadata({**metadata, "tier": tier}))
     if not ids:
         return 0
     with _CLIENT_LOCK:
-        _collection(tier).upsert(ids=ids, documents=documents, metadatas=metadatas)
+        # Embed the plaintext, store the ciphertext. Passing `embeddings=`
+        # explicitly is what makes that possible: left to itself Chroma embeds
+        # whatever is in `documents`, which for encrypted bodies would index
+        # noise and break retrieval outright.
+        vectors = embed(documents)
+        _collection(tier).upsert(
+            ids=ids,
+            documents=[crypto.encrypt(text) for text in documents],
+            embeddings=vectors,
+            metadatas=metadatas,
+        )
     return len(ids)
 
 
 CURATED_ORIGIN = "curated"
+
+# Metadata keys that stay readable in the store. Retrieval filters on these
+# (`where={"origin": ...}`, `where={"source": ...}`) and Chroma cannot match
+# what it cannot read, so encrypting them would break the tier and trust rules
+# that depend on them. Everything else is free text — a connector `title` is a
+# sentence out of the document — and gets sealed like a body.
+#
+# An allowlist rather than a blocklist: a new metadata key added later arrives
+# encrypted by default, and someone who needs it filterable has to say so here.
+# The reverse default would leak every field nobody thought about.
+_CLEARTEXT_METADATA_KEYS = frozenset({
+    "source", "tier", "origin", "reviewed", "reviewed_by",
+    "uploaded_by", "content_hash", "updated_at",
+})
+
+# Records which crypto version sealed a record, in the clear alongside the other
+# control keys. Its presence is the *only* thing that decides whether a stored
+# value gets decrypted on the way out.
+#
+# The first version of this inferred that from the value itself — "starts with
+# `v1:`, so it must already be ciphertext". That is attacker-controlled input
+# making a security decision: anyone who can file a ticket upstream sets a title
+# to the literal text `v1:AAAA`, which then skips encryption on the way in and
+# fails authentication on the way out, taking down every query that retrieves
+# that chunk. A record knows how it was written; a value does not.
+_ENC_MARKER = "enc"
+
+# Sentinel hash for a source that must be re-indexed regardless of whether its
+# upstream content moved. No real content hash can collide with it: `sha256`
+# output is hex, and this is not.
+_NEEDS_REINDEX = "!needs-reindex"
+
+
+def _seal_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Encrypt free-text metadata values, leaving the filterable keys alone.
+
+    Encrypts unconditionally — there is no "looks already encrypted" case, and
+    adding one back is what created the retrieval DoS described at `_ENC_MARKER`.
+    Callers must not seal an already-sealed record; nothing does, because the one
+    path that rewrites stored metadata (`mark_reviewed`) writes back the sealed
+    values it read.
+
+    Non-strings (bools, numbers) pass through: they carry no text and Chroma
+    needs their types intact.
+    """
+    sealed = {
+        key: (
+            value
+            if key in _CLEARTEXT_METADATA_KEYS or not isinstance(value, str)
+            else crypto.encrypt(value)
+        )
+        for key, value in metadata.items()
+    }
+    sealed[_ENC_MARKER] = crypto.VERSION
+    return sealed
+
+
+def _unseal_document(document: str, metadata: dict[str, Any]) -> str:
+    """Decrypt a stored body, using the record's marker rather than its shape.
+
+    Same rule as the metadata: how the record was written decides, never what
+    the value looks like. A body is attacker-supplied text and may itself begin
+    with `v1:`.
+    """
+    if metadata.get(_ENC_MARKER) != crypto.VERSION:
+        return document
+    return crypto.decrypt(document)
+
+
+def _unseal_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
+    """Reverse `_seal_metadata`. Raises if a sealed value fails authentication.
+
+    A record without the marker predates encryption and is returned as-is, which
+    is what lets an un-migrated store keep answering. The marker is dropped on
+    the way out: it is bookkeeping, and callers have no use for it.
+    """
+    if metadata.get(_ENC_MARKER) != crypto.VERSION:
+        return dict(metadata)
+    return {
+        key: (
+            crypto.decrypt(value)
+            if key not in _CLEARTEXT_METADATA_KEYS and isinstance(value, str)
+            else value
+        )
+        for key, value in metadata.items()
+        if key != _ENC_MARKER
+    }
 
 
 def query_by_trust(
@@ -277,12 +387,17 @@ def query(
 
     hits: list[dict[str, Any]] = []
     with _CLIENT_LOCK:
+        # Embed the question once, not once per tier. Stored vectors come from
+        # plaintext, so the query vector must too — `query_texts=` would work
+        # only because Chroma would embed it the same way, and stops being
+        # equivalent the moment anything about the stored text changes.
+        query_vector = embed([text])
         for tier in allowed_tiers:
             collection = _collection(tier)
             if collection.count() == 0:
                 continue
             result = collection.query(
-                query_texts=[text],
+                query_embeddings=query_vector,
                 n_results=min(k, collection.count()),
                 where=where,
                 include=["documents", "metadatas", "distances"],
@@ -290,7 +405,26 @@ def query(
             for document, metadata, distance in zip(
                 result["documents"][0], result["metadatas"][0], result["distances"][0]
             ):
-                hits.append({"text": document, "metadata": metadata, "distance": distance})
+                # A chunk that will not decrypt is dropped, not raised on.
+                # Anything reaching here has already failed authentication —
+                # tampering, a rotated key, a half-migrated record — and the
+                # honest response is to withhold that one chunk. Letting the
+                # exception out of `query()` turns one bad record into a failed
+                # search for every caller whose question happens to match it.
+                try:
+                    text = _unseal_document(document, metadata)
+                    unsealed = _unseal_metadata(metadata)
+                except ValueError as exc:
+                    audit_log.log(
+                        "store.decrypt", decision="deny", tier=tier,
+                        source=metadata.get("source"), reason=type(exc).__name__,
+                    )
+                    continue
+                hits.append({
+                    "text": text,
+                    "metadata": unsealed,
+                    "distance": distance,
+                })
 
     hits.sort(key=lambda hit: hit["distance"])
     return hits[:k]
@@ -311,7 +445,10 @@ def embed(texts: list[str]) -> list[list[float]]:
             from chromadb.utils import embedding_functions
 
             _embedder = embedding_functions.DefaultEmbeddingFunction()
-        return [list(vector) for vector in _embedder(texts)]
+        # Plain Python floats, not the embedder's numpy scalars: these go back
+        # into Chroma as explicit `embeddings=`, and its validator rejects a
+        # list of np.float32 even though the values are identical.
+        return [[float(value) for value in vector] for vector in _embedder(texts)]
 
 
 def mark_reviewed(tier: str, source: str, reviewer: str) -> int:
@@ -345,16 +482,99 @@ def delete_source(tier: str, source: str) -> None:
         _collection(tier).delete(where={"source": source})
 
 
+def compact() -> bool:
+    """Rewrite the SQLite file so deleted rows stop being recoverable from it.
+
+    Deleting a chunk unlinks the row; SQLite leaves the bytes sitting in free
+    pages, so `strings chroma.sqlite3` still recovers redacted text long after
+    retrieval stopped returning it. `secure_delete` zeroes pages as they are
+    freed from here on, and `VACUUM` rewrites the database to drop the free
+    pages that already exist.
+
+    Called after a sweep that retracted something, not on every delete — VACUUM
+    rewrites the whole file, which is not a per-document price worth paying.
+
+    Returns False (having logged) if the file is busy rather than raising: this
+    is hygiene, and failing an ingest because a compaction could not get a lock
+    would trade a real capability for a cleanup step that the next run repeats.
+
+    Not a secure-erase guarantee. VACUUM writes a *new* file, so the old
+    file's contents may persist in unallocated disk space, and the HNSW index
+    files are rewritten rather than scrubbed. On an SSD, wear levelling means
+    even overwriting in place proves little. Encrypted bodies are what makes
+    those remnants uninteresting; this reduces what is lying around in the
+    clear, and matters most for a store written before encryption existed.
+
+    **Does not touch `embeddings_queue`.** Chroma's write-ahead log keeps a full
+    payload for every operation ever performed, so a store migrated onto
+    encryption still holds the pre-migration plaintext there. Pruning it looks
+    trivial — delete everything at or below `MIN(seq_id)` from `max_seq_id`,
+    which is what "already applied" should mean — and it destroys the database:
+    that table tracks the *metadata* segments only, the HNSW vector segments
+    keep their own progress elsewhere, and cutting the log out from under one
+    leaves a collection whose `get()` returns every record and whose `query()`
+    returns nothing at all. Verified the hard way on this repo's own store.
+    The supported way to drop the log is `chroma utils vacuum`, which chromadb
+    1.5.9 does not ship; short of that, the way to lose the history is to delete
+    `data/chroma_db/` and re-ingest, since every chunk is reproducible from
+    `data/documents/`, `data/uploads/`, and the connector.
+    """
+    import sqlite3
+
+    database = CHROMA_DIR / "chroma.sqlite3"
+    if not database.is_file():
+        return False
+    try:
+        with _CLIENT_LOCK:
+            connection = sqlite3.connect(database, timeout=5.0)
+            try:
+                connection.execute("PRAGMA secure_delete = ON")
+                # VACUUM cannot run inside a transaction.
+                connection.execute("VACUUM")
+            finally:
+                connection.close()
+    except sqlite3.Error as exc:
+        audit_log.log(
+            "store.compact", decision="error", reason=type(exc).__name__,
+        )
+        return False
+    audit_log.log("store.compact", decision="allow", path=str(database))
+    return True
+
+
 def indexed_state(tier: str, origin: str) -> dict[str, str]:
     """Map source id -> content_hash for everything in `tier` from `origin`.
 
     Lets a connector diff upstream against what is already indexed, so a sync
     can skip unchanged records instead of re-embedding the whole corpus.
+
+    A source still holding plaintext reports a hash that cannot match anything,
+    which forces the next sync to rewrite it encrypted. Without that, the
+    incremental skip is a permanent one: a record whose content never changes
+    upstream is never re-indexed, so it would sit in the clear forever while
+    every neighbour around it got encrypted. A migration that only covers the
+    documents that happened to change is not a migration.
     """
     with _CLIENT_LOCK:
         result = _collection(tier).get(where={"origin": origin}, include=["metadatas"])
+
+    # The marker covers body and metadata together, since one seal writes both.
+    # Inspecting the values instead — "does this look like ciphertext?" — is what
+    # missed connector records: their text re-encrypted on the next sync while
+    # `title`, a sentence lifted from the document, stayed in the clear behind an
+    # unchanged content hash.
+    plaintext = {
+        metadata["source"]
+        for metadata in result["metadatas"]
+        if metadata.get("source") and metadata.get(_ENC_MARKER) != crypto.VERSION
+    }
+
     return {
-        metadata["source"]: metadata.get("content_hash", "")
+        metadata["source"]: (
+            _NEEDS_REINDEX
+            if metadata["source"] in plaintext
+            else metadata.get("content_hash", "")
+        )
         for metadata in result["metadatas"]
         if metadata.get("source")
     }

@@ -14,6 +14,7 @@ from __future__ import annotations
 
 import base64
 import codecs
+import html
 import math
 import re
 import unicodedata
@@ -189,6 +190,84 @@ def _decoded_variants(text: str) -> list[str]:
             except Exception:  # noqa: BLE001 - a run that is not base64 is not a leak
                 continue
     return variants
+
+
+# ---------------------------------------------------------------------------
+# Known-secret egress.
+#
+# The block rules above catch credential *shapes* (sk-..., AKIA...). A secret
+# with no recognisable shape — a canary token planted in a restricted document,
+# a signing key — is caught only if its exact value is registered here. And a
+# value registered once still has to be caught however the model is steered into
+# emitting it: spaced, one character per line, spelled in NATO phonetic
+# ("Charlie Alpha November..."), base64'd, or reversed. Matching the literal
+# string catches none of those. So a registered secret is reduced to a canonical
+# core — letters and digits only, homoglyphs and diacritics folded — and the
+# response is reduced the same way through several projections before a
+# substring test. Any projection that contains the core is a leak.
+_SECRETS: list[str] = []
+
+_NON_ALNUM = re.compile(r"[^a-z0-9]+")
+
+# ICAO/NATO spelling alphabet plus the digit words a model uses when told to
+# "spell it out one per line". Folded back to their letter/digit so a spelled
+# secret collapses to the same core as the written one.
+_PHONETIC = {
+    "alpha": "a", "alfa": "a", "bravo": "b", "charlie": "c", "delta": "d",
+    "echo": "e", "foxtrot": "f", "golf": "g", "hotel": "h", "india": "i",
+    "juliet": "j", "juliett": "j", "kilo": "k", "lima": "l", "mike": "m",
+    "november": "n", "oscar": "o", "papa": "p", "quebec": "q", "romeo": "r",
+    "sierra": "s", "tango": "t", "uniform": "u", "victor": "v", "whiskey": "w",
+    "xray": "x", "yankee": "y", "zulu": "z",
+    "zero": "0", "one": "1", "two": "2", "three": "3", "four": "4", "five": "5",
+    "six": "6", "seven": "7", "eight": "8", "nine": "9", "niner": "9",
+}
+
+
+def _canonical_secret(text: str) -> str:
+    """Letters and digits only, lowercased, homoglyphs and diacritics folded."""
+    return _NON_ALNUM.sub("", _normalise(text).lower())
+
+
+def _phonetic_fold(text: str) -> str:
+    """Collapse spelled-out letters (NATO words, digit words) back to characters.
+
+    Unknown words become a boundary rather than text, so only genuinely
+    spelled-out runs collapse into a candidate secret — prose does not.
+    """
+    return "".join(
+        _PHONETIC.get(word, word if word.isdigit() else " ")
+        for word in re.findall(r"[a-z]+|[0-9]", _normalise(text).lower())
+    )
+
+
+def protect_secret(value: str) -> None:
+    """Register `value` so it is blocked in output in any handled surface form.
+
+    A canonical core under 8 characters is not registered: it collides with
+    ordinary prose and would start withholding honest answers. Real secrets
+    (API keys, signing keys, canary tokens) clear that easily.
+    """
+    canon = _canonical_secret(value)
+    if len(canon) >= 8 and canon not in _SECRETS:
+        _SECRETS.append(canon)
+
+
+def leaks_secret(text: str) -> bool:
+    """True if a registered secret appears in `text` under any handled encoding.
+
+    ponytail: handles spacing, one-per-line, homoglyphs, NATO/digit spelling,
+    base64, rot13, and reversal. An attacker who invents an encoding the model
+    can follow and this cannot undo (a cipher agreed in the question) still gets
+    through — the same open edge `_decoded_variants` documents.
+    """
+    if not _SECRETS:
+        return False
+    haystacks = [
+        _canonical_secret(projection)
+        for projection in (text, _phonetic_fold(text), *_decoded_variants(text))
+    ]
+    return any(secret in hay for secret in _SECRETS for hay in haystacks)
 
 
 def leaks_hidden_context(text: str) -> bool:
@@ -410,6 +489,8 @@ def redact_ungrounded(text: str, documents: list[str]) -> tuple[str, int]:
 def scan(text: str) -> tuple[list[str], list[str]]:
     """Return (block_hits, redact_hits) as rule names. Both empty means clean."""
     blocked = [name for name, pattern in _BLOCK_RULES if pattern.search(text)]
+    if leaks_secret(text):
+        blocked.append("known_secret")
     if leaks_hidden_context(text):
         blocked.append("hidden_context_leak")
     elif resembles_hidden_context(text):
@@ -425,6 +506,126 @@ def redact(text: str) -> str:
     for _, pattern in _REDACT_RULES:
         result = pattern.sub(REDACTION, result)
     return result
+
+
+# ---------------------------------------------------------------------------
+# Executable markup.
+#
+# An answer is prose drawn from a text corpus. It has no legitimate reason to
+# carry a `<script>` block, an inline event handler, or a `javascript:` link —
+# those arrive one way, which is a retrieved document steering the model into
+# emitting them, and they matter because the app hands the string to consumers
+# it does not control. The shipped UI renders with `textContent` and is inert;
+# a consumer using `innerHTML`, a markdown renderer, a Slack card, or React's
+# `dangerouslySetInnerHTML` executes the same bytes. See
+# redteam/findings/improper-output-handling.md.
+#
+# Encoding is contextual and belongs where a value is rendered, so this is not
+# the app doing the consumer's job. It is the app declining to emit executable
+# markup it was never asked for — the answer is served defanged in every
+# rendering context instead of being safe in exactly one.
+
+# A denylist of "dangerous constructs" was the first shape of this and it leaked
+# three ways at once: an entity-encoded scheme (`java&#x73;cript:`) slipped a
+# literal match, a plain `<img src="https://attacker/track">` carried no event
+# handler and no active tag so nothing fired, and a fragment with no tag at all
+# (`" autofocus onfocus=alert(1) x="`) broke out of an attribute in a consumer
+# that interpolated it. Enumerating what is dangerous never terminates.
+#
+# The invariant is the other way round and much simpler: an answer is prose
+# drawn from a corpus of .txt and .md files, so it contains **no HTML at all**.
+# Anything that a browser would parse as an element is illegitimate regardless
+# of which element it is or what it carries.
+
+# Real HTML element names. An unknown name (`<see appendix>` in prose) is left
+# alone: a browser parses it into an inert unknown element that neither executes
+# nor fetches. Matching on the name is what keeps ordinary text unmangled while
+# still catching `<img>`, which the previous active-tag list did not.
+_HTML_ELEMENTS = (
+    "a|abbr|address|area|article|aside|audio|b|base|bdi|bdo|blockquote|body|br|"
+    "button|canvas|caption|cite|code|col|colgroup|data|datalist|dd|del|details|"
+    "dfn|dialog|div|dl|dt|em|embed|fieldset|figcaption|figure|footer|form|h1|h2|"
+    "h3|h4|h5|h6|head|header|hgroup|hr|html|i|iframe|img|input|ins|kbd|label|"
+    "legend|li|link|main|map|mark|math|menu|meta|meter|nav|noscript|object|ol|"
+    "optgroup|option|output|p|param|picture|pre|progress|q|rp|rt|ruby|s|samp|"
+    "script|search|section|select|slot|small|source|span|strong|style|sub|"
+    "summary|sup|svg|table|tbody|td|template|textarea|tfoot|th|thead|time|title|"
+    "tr|track|u|ul|var|video|wbr"
+)
+_HTML_ELEMENT = re.compile(rf"</?(?:{_HTML_ELEMENTS})\b", re.I)
+
+# Inline event handlers, matched with no surrounding tag required — the
+# attribute-breakout payload has no tag, and it is still what makes the fragment
+# executable once a consumer pastes it inside one.
+#
+# An explicit list of real event names rather than `on[a-z]+`: this decides
+# whether the whole answer gets escaped, and escaping rewrites quotes, so a
+# false positive on prose ("onboarding = 3 days") is a visible cost.
+_EVENT_HANDLER = re.compile(
+    r"\bon(?:abort|animation[a-z]+|auxclick|before[a-z]+|blur|cancel|canplay"
+    r"|canplaythrough|change|click|close|contextmenu|copy|cuechange|cut"
+    r"|dblclick|drag[a-z]*|drop|durationchange|emptied|ended|error|focus"
+    r"|focusin|focusout|formdata|hashchange|input|invalid|key(?:down|press|up)"
+    r"|load|loadeddata|loadedmetadata|loadstart|message|mouse[a-z]+|paste"
+    r"|pause|play|playing|pointer[a-z]+|popstate|progress|ratechange|reset"
+    r"|resize|scroll|scrollend|search|securitypolicyviolation|seeked|seeking"
+    r"|select|show|slotchange|stalled|storage|submit|suspend|timeupdate|toggle"
+    r"|touch[a-z]+|transition[a-z]+|unload|volumechange|waiting|wheel)\s*=",
+    re.I,
+)
+
+# A dangerous scheme, but only where a renderer would treat it as a URL: an HTML
+# attribute or a markdown link target. Anchoring to those contexts is what keeps
+# ordinary prose ("the data: 30 days from delivery") out of it.
+_DANGEROUS_URL = re.compile(
+    r"""(?:(?:href|src|action|formaction|xlink:href)\s*=\s*["']?|\]\(\s*)"""
+    r"\s*(javascript|vbscript|data)\s*:",
+    re.I,
+)
+
+
+def neutralize_markup(text: str) -> tuple[str, bool]:
+    """Defang executable markup. Returns (text, whether anything was defanged).
+
+    Detection runs against an entity-decoded *copy* of the answer, because
+    `java&#x73;cript:` and `javascript:` are the same URL to a parser and only
+    one of them matches a literal pattern. The copy is used to decide; the
+    original is what gets transformed, so nothing is silently entity-decoded on
+    its way to the caller.
+
+    Two transforms when it fires:
+
+    - A dangerous scheme in a URL position is broken textually (`javascript:` ->
+      `javascript[blocked]:`). Escaping alone does not cover this — a markdown
+      renderer builds a link out of `[click](javascript:alert(1))` whether or not
+      the surrounding characters were escaped.
+    - The **whole** answer is then HTML-escaped, quotes included. Whole rather
+      than per-match because escaping only the spans that matched leaves the
+      brackets around them free to form a new construct across the boundary;
+      quotes included because a consumer that interpolates the answer into an
+      attribute is exactly what the breakout payload targets.
+
+    Only fires on an answer that already carries markup, so `if x < 5` and
+    `section 2 <see appendix>` come back byte-for-byte unchanged. When it does
+    fire the answer stays readable — `&lt;script&gt;` in a plain-text consumer is
+    ugly, and that is the correct trade against the same string running in an
+    HTML one.
+    """
+    probe = html.unescape(text)
+    if not (
+        _HTML_ELEMENT.search(probe)
+        or _EVENT_HANDLER.search(probe)
+        or _DANGEROUS_URL.search(probe)
+    ):
+        return text, False
+
+    text = _DANGEROUS_URL.sub(
+        lambda match: match.group(0).replace(
+            match.group(1) + ":", match.group(1) + "[blocked]:"
+        ),
+        text,
+    )
+    return html.escape(text, quote=True), True
 
 
 def apply(text: str, documents: list[str] | None = None) -> tuple[str, list[str], bool]:
@@ -458,5 +659,11 @@ def apply(text: str, documents: list[str] | None = None) -> tuple[str, list[str]
             True,
         )
     if redact_hits:
-        return redact(text), redact_hits, False
-    return text, [], False
+        text = redact(text)
+
+    # Last, on whatever text is actually going to be served — including a
+    # redacted one, since redaction rewrites spans and must not be the step that
+    # leaves markup unexamined.
+    text, defanged = neutralize_markup(text)
+    rules = [*redact_hits, "executable_markup"] if defanged else list(redact_hits)
+    return text, rules, False

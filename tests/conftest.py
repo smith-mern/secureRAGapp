@@ -18,6 +18,11 @@ os.environ["AUDIT_LOG_PATH"] = os.path.join(
     tempfile.gettempdir(), "securerag-test-audit.log"
 )
 
+# Document bodies are encrypted at rest, so anything that touches the store
+# needs a key. A fixed test value, not the deployment's — a suite that could
+# decrypt the real corpus is a suite that can leak it into a failure message.
+os.environ["STORE_ENCRYPTION_KEY"] = "test-store-key-not-the-deployments"
+
 # Tests assert on the vulnerable-by-default behaviour and build the secure
 # variant explicitly, so never inherit a real .env's phase switch.
 os.environ.pop("SECURITY_FILTERS_ENABLED", None)

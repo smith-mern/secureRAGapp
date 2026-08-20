@@ -51,6 +51,30 @@ def require(name: str) -> str:
     return value
 
 
+# Roughly what `secrets.token_urlsafe(24)` produces. Below this a key stops
+# being key material and becomes a password, and the store is full of
+# authenticated ciphertext — an attacker holding a copy can test guesses offline
+# against the tag as fast as they like, with no rate limit and nothing logged.
+MIN_KEY_CHARS = 32
+
+
+def require_key(name: str) -> str:
+    """Return a secret that must be long enough to be a key, or raise.
+
+    Length is a crude proxy for entropy and does not stop `"a" * 32`. It is
+    still worth having: it rejects `password`, `changeme`, and the single
+    character someone types to get the app to boot, which is the failure this
+    actually sees. The error never echoes the value.
+    """
+    value = require(name)
+    if len(value) < MIN_KEY_CHARS:
+        raise MissingSecret(
+            f"{name} must be at least {MIN_KEY_CHARS} characters. Generate one "
+            'with: python3 -c "import secrets;print(secrets.token_urlsafe(32))"'
+        )
+    return value
+
+
 def optional(name: str, default: str) -> str:
     """Return the secret `name`, or `default`.
 
@@ -99,8 +123,15 @@ def check_required() -> None:
     key, so the offline configuration still boots with nothing but the signing
     key set.
     """
-    names = ["SESSION_SIGNING_KEY"]
+    # STORE_ENCRYPTION_KEY is required for the same reason as the signing key:
+    # defaulting it would mean a store that looks encrypted and is not, which is
+    # worse than one that plainly is not. Kept separate from the signing key so
+    # rotating sessions does not make the corpus undecryptable.
+    # Both are key material and both get the length floor: a short signing key
+    # is forgeable and a short store key is guessable offline against the
+    # ciphertext. An API key is whatever the provider issued, so it only has to
+    # be present.
+    for name in ("SESSION_SIGNING_KEY", "STORE_ENCRYPTION_KEY"):
+        require_key(name)
     if os.environ.get("LLM_PROVIDER", "ollama").strip().lower() == "groq":
-        names.append("GROQ_API_KEY")
-    for name in names:
-        require(name)
+        require("GROQ_API_KEY")

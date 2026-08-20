@@ -15,12 +15,14 @@ from __future__ import annotations
 
 import asyncio
 import contextlib
+import os
 import sys
+from typing import Any
 from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, status
+from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
@@ -61,11 +63,31 @@ async def _connector_sync_loop(interval: int) -> None:
             )
 
 
+def register_egress_secrets() -> None:
+    """Register known secret values so the output filter blocks them verbatim.
+
+    The signing/encryption keys must never appear in an answer; CANARY_TOKENS is
+    a comma-separated list of canary strings (e.g. one planted in a restricted
+    document) so a red-team run can confirm the egress block end to end. Values
+    are registered, never logged.
+    """
+    from app.filters import output_filter
+
+    for name in ("SESSION_SIGNING_KEY", "STORE_ENCRYPTION_KEY", "GROQ_API_KEY"):
+        value = os.environ.get(name, "")
+        if value:
+            output_filter.protect_secret(value)
+    for token in os.environ.get("CANARY_TOKENS", "").split(","):
+        if token.strip():
+            output_filter.protect_secret(token.strip())
+
+
 @asynccontextmanager
 async def lifespan(_: FastAPI):
     # Fail at boot, not on the first request, if a secret is missing.
     secrets.check_required()
     seed_users()
+    register_egress_secrets()
     secure = secrets.filters_enabled()
     # `digest` is what a swapped generator changes. The app pins a mutable tag,
     # so recording the content digest each boot is the only way a re-pointed tag
@@ -119,6 +141,43 @@ app = FastAPI(title="secureRAGapp", version="0.1.0", lifespan=lifespan)
 # First middleware registered is outermost, so the size check runs before any
 # body is buffered. See app/limits.py for what each ceiling costs unbounded.
 app.middleware("http")(limits.body_size_guard)
+
+
+# Headers the browser enforces, on every response. The answer body carries text
+# the model can be steered into producing, so the two that matter here are
+# `nosniff` — without it a browser pointed straight at /query may sniff the JSON
+# as HTML and render the payload inside it — and `connect-src 'self'`, which
+# stops the exfiltration half of an XSS even where the markup does execute.
+#
+# `unsafe-inline` is present because index.html carries an inline <style> and
+# <script>. That makes the script-src clause worth little against injected
+# markup; the clauses doing real work are connect-src, img-src, frame-ancestors,
+# and form-action, which bound where a payload could send anything. Moving the
+# inline blocks into files and dropping unsafe-inline is the upgrade.
+# ponytail: one policy for the JSON API and the one HTML page. Split it if the
+# app ever serves a second page with different needs.
+_SECURITY_HEADERS = {
+    "X-Content-Type-Options": "nosniff",
+    "Referrer-Policy": "no-referrer",
+    "Content-Security-Policy": (
+        "default-src 'none'; "
+        "script-src 'unsafe-inline'; "
+        "style-src 'unsafe-inline'; "
+        "connect-src 'self'; "
+        "img-src 'self'; "
+        "frame-ancestors 'none'; "
+        "base-uri 'none'; "
+        "form-action 'none'"
+    ),
+}
+
+
+@app.middleware("http")
+async def security_headers(request: Request, call_next: Any) -> Response:
+    response = await call_next(request)
+    for header, value in _SECURITY_HEADERS.items():
+        response.headers.setdefault(header, value)
+    return response
 
 
 class LoginRequest(BaseModel):

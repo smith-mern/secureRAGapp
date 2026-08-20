@@ -65,7 +65,13 @@ from app.auth import TIERS, User, allowed_tiers
 from app.filters import output_filter, prompt_filter
 from app import limits
 from app.filters.input_validation import validate_query
-from app.retriever import TierScopedRetriever, origin_of, prefer_trusted, source_of
+from app.retriever import (
+    TierScopedRetriever,
+    is_curated,
+    origin_of,
+    prefer_trusted,
+    source_of,
+)
 from app.secrets import agentic_enabled, filters_enabled, optional, require
 
 # "ollama" keeps generation on this machine and is the default. "groq" sends
@@ -846,6 +852,13 @@ def _finalize(
         safe_text, output_rules, blocked = text, [], False
 
     sources = sorted({source_of(doc) for doc in state["docs"]})
+    # Provenance for the reader: a source that answered but is not curated is an
+    # approved upload — vetted enough to answer, but user-submitted, not host
+    # content. F2 poisoning delivers a false fact through exactly this path, so
+    # the answer must not render it indistinguishable from curated sources.
+    uploaded_sources = sorted(
+        {source_of(doc) for doc in state["docs"] if not is_curated(doc)}
+    )
     audit_log.log(
         "query.answered", actor=user.username, decision="deny" if blocked else "allow",
         mode="secure" if secure else "insecure",
@@ -858,6 +871,7 @@ def _finalize(
     return {
         "answer": safe_text,
         "sources": [] if blocked else sources,
+        "uploaded_sources": [] if blocked else uploaded_sources,
         "refused": blocked,
         "flags": state["flags"] + output_rules,
     }

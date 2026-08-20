@@ -16,5 +16,3 @@ data/uploads/
 # observability runtime state
 observability/data/
 
-# serena MCP project scaffolding, not part of the app
-.serena/

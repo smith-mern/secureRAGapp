@@ -71,6 +71,16 @@ def chunk_text(text: str, size: int = CHUNK_CHARS, overlap: int = CHUNK_OVERLAP)
 
 
 def _index(tier: str, source: str, text: str, metadata: dict) -> int:
+    """Replace every chunk of `source`. Delete first, then write.
+
+    Chunk ids are `source:index`, so a re-index only overwrites ids 0..n-1 of
+    the *new* version. A document that got shorter — a paragraph redacted, a
+    ticket trimmed, a file emptied — leaves its old tail behind under the higher
+    ids: still embedded, still carrying the original `origin`, still retrievable.
+    Redaction at the source then never reaches the index, which is the only copy
+    an answer is actually drawn from.
+    """
+    vectorstore.delete_source(tier, source)
     chunks = chunk_text(text)
     return vectorstore.add_chunks(
         tier,
@@ -126,6 +136,7 @@ def ingest_tier(
     prefix = "" if origin == CURATED_ORIGIN else f"{origin}/"
 
     written = 0
+    seen: set[str] = set()
     for path in sorted(tier_dir.rglob("*")):
         if not path.is_file() or path.name == ".gitkeep":
             continue
@@ -143,12 +154,40 @@ def ingest_tier(
             continue
 
         source = prefix + str(resolved.relative_to(root))
+        seen.add(source)
         count = _index(tier, source, text, {"origin": origin})
         written += count
         audit_log.log(
             "ingest.file", actor=actor, decision="allow",
             origin=origin, tier=tier, source=source, chunks=count,
         )
+
+    # Reconcile deletions. Indexing is otherwise add-only: a document deleted
+    # from disk keeps answering forever, because nothing on the write path ever
+    # revisits a source it did not just read. `sync_connector` already reconciles
+    # its origin this way — on-disk content is not a weaker case, it is the one
+    # someone deletes by hand and reasonably assumes is gone.
+    #
+    # Scoped to this tier *and* this origin, so an uploads sweep can never
+    # retract curated content, and vice versa.
+    retracted = 0
+    for source in set(vectorstore.indexed_state(tier, origin)) - seen:
+        vectorstore.delete_source(tier, source)
+        retracted += 1
+        audit_log.log(
+            "ingest.retract", actor=actor, decision="allow",
+            origin=origin, tier=tier, source=source, reason="gone_from_disk",
+        )
+
+    # Deleting or replacing a document unlinks its rows but leaves the old text
+    # in the file's free pages, where it stays greppable. Every re-index is a
+    # delete-then-write, so a plain re-ingest frees plaintext too — which is
+    # exactly the migration path onto encrypted bodies, and the one case where
+    # scrubbing matters most.
+    # ponytail: compacts once per tier, so a full run VACUUMs three times. Hoist
+    # it to ingest_all if the store ever grows enough for that to be felt.
+    if written or retracted:
+        vectorstore.compact()
 
     return written
 
@@ -204,10 +243,8 @@ def store_upload(
     destination.write_bytes(encoded)
 
     source = f"{UPLOAD_ORIGIN}/{tier}/{filename}"
-    if replaced:
-        # Chunk ids are source:index, so a shorter replacement would leave the
-        # tail of the previous version retrievable. Drop the old chunks first.
-        vectorstore.delete_source(tier, source)
+    # A shorter replacement must not leave the tail of the previous version
+    # retrievable; `_index` drops the old chunks before writing the new ones.
     # reviewed=False: an upload is the one write path reachable with nothing but
     # a password, so it is indexed as unreviewed and cannot answer anyone until
     # an `approver` account signs it off. See app/retriever.py:is_trusted.
@@ -300,6 +337,12 @@ def sync_connector(actor: str = "system") -> dict[str, int]:
                 added += 1
             else:
                 updated += 1
+
+    # Same reason as the on-disk sweep: updates and deletes free the old text
+    # into the file rather than erasing it. Skipped when the sync was a no-op,
+    # which is the common case for a scheduled run.
+    if added or updated or deleted:
+        vectorstore.compact()
 
     audit_log.log(
         "connector.sync", actor=actor, decision="allow", connector=tickets.ORIGIN,

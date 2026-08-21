@@ -6,58 +6,57 @@ A local RAG application built to be attacked. Three phases: build it
 exploitable, red-team it and capture the exploits as repeatable scripts, then
 turn the defenses on and report honestly what still fails.
 
-**Status: phase 2 done, phase 3 not started.** The app is fully implemented and
-runs vulnerable by default — `SECURITY_FILTERS_ENABLED` defaults to `false`.
-Nine findings are written up with working attack scripts. Phase 3 is underway:
-the deployment `.env` now sets the flag `true`, and re-runs have begun.
+**Status: all three phases complete.** The app is fully implemented and still
+runs vulnerable by default — `SECURITY_FILTERS_ENABLED` defaults to `false`, so
+the phase-2 configuration stays reproducible. Fourteen findings are written up
+with working attack scripts, each carrying an observed secure-mode result.
 
 | Phase | State |
 |---|---|
 | 1 — build vulnerable | complete |
-| 2 — attack | complete: 9 findings, 11 attack scripts, spikee harness wired |
-| 3 — secure & re-run | in progress: 1 of 9 re-run and verified |
+| 2 — attack | complete: 14 findings, 15 attack scripts, spikee harness wired |
+| 3 — secure & re-run | complete: every finding cites an observed secure-mode run; residuals stated per finding |
 
 ## Findings
 
-All nine live in `redteam/findings/` as Vulnerability / Exploit / Detection /
-Mitigation, each citing a script in `redteam/attacks/`. "Flag closes it" is what
-the finding *predicts* for phase 3; a finding is only settled once its
-Mitigation section cites an observed run, so treat the column as a prediction
-until then.
+All fourteen live in `redteam/findings/` as Vulnerability / Exploit / Detection
+/ Mitigation, each citing a script in `redteam/attacks/`. The state column
+records what was **measured** in secure mode, not what the flag was expected to
+do — a finding is settled only once its Mitigation section cites an observed
+run.
 
-Verified so far:
+Three states worth distinguishing, because the split is the phase-3 result:
 
-- **chunk-injection-screening** — re-run 2026-08-17, `SCREENED` (exit 1), with a
-  `retrieval.chunk_dropped` audit event supplying causation. Phase 3 also closed
-  a gap the flag did not: `source` metadata reached the prompt unscreened and
-  unescaped.
-- **output-filter-bypass** — the egress filter now blocks a *registered* secret
-  under reframing: spacing, one-token-per-line, NATO-phonetic, homoglyphs,
-  base64, rot13, and reversal all fold to the same canonical core before the
-  match (`known_secret` rule; register via `CANARY_TOKENS`, and signing/API keys
-  automatically). What still escapes is an encoding invented in the question that
-  the model can follow and the filter cannot undo — a substitution cipher agreed
-  in the prompt, say — so the filter stays a backstop, not the boundary. Enabling
-  the filters had also introduced a disclosure of their own — blocked responses
-  returned the *name* of the rule that fired — now fixed. Script re-run still
-  outstanding.
+- **Closed by the flag** — the gated defense was the fix, and turning it on was enough.
+- **Fixed in code** — the flag did nothing, so the control is structural and (where it is a defect rather than a defense) unconditional in both modes.
+- **Partial** — measured, still gets through, documented rather than claimed closed.
 
-| Finding | Sev | Flag closes it |
+| Finding | Sev | State after phase 3 |
 |---|---|---|
-| [cross-tier-retrieval-leak](redteam/findings/cross-tier-retrieval-leak.md) — public reader retrieves restricted docs | High | yes, with residual risk |
-| [vectorstore-no-access-control](redteam/findings/vectorstore-no-access-control.md) — every tier readable from `data/chroma_db/`, no auth, no encryption | High | no — no in-app fix exists |
-| [output-filter-bypass](redteam/findings/output-filter-bypass.md) — secrets and PII egress unscrubbed | High | partly — backstop, not a boundary |
-| [chunk-injection-screening](redteam/findings/chunk-injection-screening.md) — retrieved chunks steer the model | High | partly — regex filter, beatable |
-| [corpus-knowledge-poisoning](redteam/findings/corpus-knowledge-poisoning.md) — an `uploader` account makes the app assert false facts | High | no — fixed directly: unreviewed content answers nobody (6/6 -> 0/6, holds at 40 copies and on uncovered topics) |
-| [model-denial-of-service](redteam/findings/model-denial-of-service.md) — one reader stalls `/health` for everyone | High | no |
-| [source-name-disclosure](redteam/findings/source-name-disclosure.md) — `sources` leaks filenames and tiers across clearance | Medium | yes |
-| [improper-output-handling](redteam/findings/improper-output-handling.md) — attacker markup returned unencoded | Medium | no |
-| [supply-chain-vulnerabilities](redteam/findings/supply-chain-vulnerabilities.md) — 0/10 deps pinned; embedding model cache unverified | Medium | no — fixed directly (lockfile + load-time model verification) |
+| [cross-tier-retrieval-leak](redteam/findings/cross-tier-retrieval-leak.md) — public reader retrieves restricted docs | High | **closed by the flag** — retrieval scopes to `allowed_tiers`; `sources: []`, refused |
+| [vectorstore-no-access-control](redteam/findings/vectorstore-no-access-control.md) — every tier readable from `data/chroma_db/`, no auth | High | **partial** — bodies and free-text metadata encrypted at rest (`strings \| grep -ci northwind`: 69 → 0), store dir `0700`. Tier labels, source paths and embeddings still recoverable; the key lives where the app can read it. No in-app fix closes it |
+| [output-filter-bypass](redteam/findings/output-filter-bypass.md) — secrets and PII egress unscrubbed | High | **closed by the flag** for registered secrets, including reframing (spacing, per-line, NATO, homoglyph, base64, rot13, reversal). An in-prompt cipher still escapes — backstop, not a boundary |
+| [chunk-injection-screening](redteam/findings/chunk-injection-screening.md) — retrieved chunks steer the model | High | **closed by the flag** — re-run 2026-08-17, `SCREENED` (exit 1) with a `retrieval.chunk_dropped` event. Regex-based, so still beatable by homoglyphs or a split instruction |
+| [corpus-knowledge-poisoning](redteam/findings/corpus-knowledge-poisoning.md) — an `uploader` account makes the app assert false facts | High | **fixed in code** — the flag does nothing here. Review gate plus disjoint `uploader`/`approver`: 6/6 → 0/6, holds at 40 copies and on uncovered topics |
+| [hidden-context-exposure](redteam/findings/hidden-context-exposure.md) — the app discloses its own system prompt | High | **partial** — prompts self-register at their definition site, 8-gram overlap detection. Interleaving still serves at 3/3 and 5/2 dilution; the class is not closed |
+| [misinformation-ungrounded-answers](redteam/findings/misinformation-ungrounded-answers.md) — app states figures no document contains | High | **partial** — fabricated quantities closed by a numeric support check (the question does not count as support); prose claims still open |
+| [stale-embedding-persistence](redteam/findings/stale-embedding-persistence.md) — redacted content keeps answering | High | **fixed in code**, unconditional — `_index` deletes before write, `ingest_tier` reconciles deletions. Retraction is only as timely as the next sweep |
+| [model-denial-of-service](redteam/findings/model-denial-of-service.md) — one reader stalls `/health` for everyone | High | **fixed in code**, unconditional — handlers off the event loop, bounded auth cost, body caps: 1970 ms → 26 ms |
+| [source-name-disclosure](redteam/findings/source-name-disclosure.md) — `sources` leaks filenames and tiers across clearance | Medium | **closed by the flag**, but as a side effect of tier scoping — there is no dedicated guard on the `sources` field |
+| [improper-output-handling](redteam/findings/improper-output-handling.md) — attacker markup returned unencoded | Medium | **fixed in code** — markup neutralized at egress, after a denylist of dangerous constructs lost three ways in one sitting |
+| [excessive-agency](redteam/findings/excessive-agency.md) — the agent loop executes whatever tool call the model emits | Medium | **fixed in code** — `_mediate` dispatches by name, budgets, validates and screens; a chunk-relevance gate closed the padding bypass. `AGENTIC_RAG=true` only |
+| [supply-chain-vulnerabilities](redteam/findings/supply-chain-vulnerabilities.md) — 0/10 deps pinned; embedding model cache unverified | Medium | **fixed in code** — lockfile plus periodic model-digest recheck. Residual TOCTOU window is now the recheck interval, not the process lifetime |
+| [egress-filter-not-a-boundary](redteam/findings/egress-filter-not-a-boundary.md) — refusal oracle (N1) and format gaps (N2) | Low–Med | **N1 closed** — all refusals return one cause-free string. **N2 accepted residual** — no finite rule set closes the reframing class |
+
+[hidden-context-exposure-coverage](redteam/findings/hidden-context-exposure-coverage.md)
+is a companion map rather than a finding: all 63 enumerated vectors, what holds
+each and what does not, with nothing marked closed on the strength of an
+argument alone.
 
 Attack scripts run against a live app and are phase-agnostic — same script, both
-phases. The eight Python exploits signal by exit code: 0 means the exploit
-landed, 1 means it was blocked. The two DoS shell scripts and the supply-chain
-probe report by output instead.
+phases. Twelve of the thirteen Python exploits signal by exit code: 0 means the
+exploit landed, 1 means it was blocked. The two DoS shell scripts and the
+supply-chain probe report by output instead.
 
 ```sh
 SECURERAG_URL=http://localhost:8000 ATTACK_USER=carol ATTACK_PASS=... \

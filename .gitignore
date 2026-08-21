@@ -16,3 +16,6 @@ data/uploads/
 # observability runtime state
 observability/data/
 
+
+# Local tooling state (serena MCP index)
+.serena/

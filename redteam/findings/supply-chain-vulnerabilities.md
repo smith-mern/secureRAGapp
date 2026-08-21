@@ -3,8 +3,8 @@
 **Severity:** Medium (both sub-findings). Neither is an unauthenticated request to
 `/query` that wins — unlike the injection and DoS findings, these are *posture*
 exposures with a real precondition. Their ceilings are high (code execution on the
-box that stores restricted text in the clear; silent control of retrieval for every
-tier), which is why they are Medium and not Low.
+box that holds the vector store's decryption key; silent control of retrieval for
+every tier), which is why they are Medium and not Low.
 **Attack:** [`redteam/attacks/supply_chain_dependency_and_model.py`](../attacks/supply_chain_dependency_and_model.py)
 (Part A audits the dependency posture; Part B demonstrates the model-cache gap on a
 throwaway copy — the real cache is never modified).
@@ -51,8 +51,9 @@ malicious artifact entering the resolved set on a rebuild:
 - **Compromised release** — an upstream account or CI takeover republishes a version.
 
 Any of these executes attacker code at install time (`setup.py`, or first import),
-on the machine that holds **every tier's restricted document text in the clear**
-(`data/chroma_db/`). That is the worst ceiling of the three findings and the reason
+**as the user that runs the app** — the one principal encryption at rest cannot
+exclude, since that user must hold `STORE_ENCRYPTION_KEY` to answer a query at all.
+Encrypting `data/chroma_db/` does not lower this ceiling. That is the worst ceiling of the three findings and the reason
 this is not Low. It is Medium rather than High because realizing it needs a poisoned
 artifact to actually exist and resolve — it is latent, not attacker-triggerable
 against this deployment today.
@@ -115,8 +116,8 @@ ERROR: THESE PACKAGES DO NOT MATCH THE HASHES FROM THE REQUIREMENTS FILE.
 ```
 
 That second run is the whole mitigation in one line: a substituted artifact now
-fails the build instead of executing its `setup.py` on the box that stores every
-tier's text in the clear.
+fails the build instead of executing its `setup.py` as the user that holds the
+store's decryption key.
 
 **Residual:** the lock records what PyPI served *today*. It makes a change
 detectable and blocks substitution of a pinned artifact; it does not tell you

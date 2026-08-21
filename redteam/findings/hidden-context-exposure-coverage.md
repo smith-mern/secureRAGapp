@@ -56,7 +56,7 @@ Statuses:
 | 22 | Indirect prompt injection from documents | **elsewhere** | [chunk-injection-screening](chunk-injection-screening.md). Also covered downstream now: if injection succeeds and the model discloses, the egress controls in this finding catch the disclosure. |
 | 23 | Cross-chunk instruction splitting | **elsewhere, open** | Named unfixed in `CLAUDE.md` and in [chunk-injection-screening](chunk-injection-screening.md). Egress controls are the compensating layer. |
 | 24 | Reviewed-document injection | **elsewhere** | [corpus-knowledge-poisoning](corpus-knowledge-poisoning.md). `approver` is disjoint from `uploader` by design. |
-| 25 | Curated-document compromise | **accepted** | Producing curated content requires host access. An attacker with that has the vector store in the clear (60) and does not need this. |
+| 25 | Curated-document compromise | **accepted** | Producing curated content requires host access, which means running as the app user — who must hold `STORE_ENCRYPTION_KEY` to answer a query at all, and so has the corpus (60) without needing this. |
 | 26 | Connector-source injection | **elsewhere** | [corpus-knowledge-poisoning](corpus-knowledge-poisoning.md); connector records index `reviewed=false`. |
 | 27 | Retrieval via semantic query rewriting | **elsewhere** | [excessive-agency](excessive-agency.md). |
 
@@ -116,7 +116,7 @@ Statuses:
 | 57 | Raw request logging by infrastructure | **out of scope** | Proxy/APM configuration, not application code. |
 | 58 | Hosted-model disclosure (Groq) | **accepted** | Documented in `CLAUDE.md` and `.env.example`: enabling Groq sends questions and chunks to a third party and voids the offline property. Opt-in, and not for the restricted tier. |
 | 59 | Local daemon telemetry | **out of scope** | Ollama process configuration. |
-| 60 | Vector-store filesystem access | **accepted / elsewhere** | [vectorstore-no-access-control](vectorstore-no-access-control.md); `CLAUDE.md` names it a property of the design. Anyone with this access has the corpus and needs none of the vectors above. |
+| 60 | Vector-store filesystem access | **accepted / elsewhere** | [vectorstore-no-access-control](vectorstore-no-access-control.md); `CLAUDE.md` names it a property of the design. Bodies are ciphertext at rest since `app/crypto.py`, so a bare filesystem read yields tier labels, source paths and embeddings; anyone who can run as the app user holds the key and has the corpus outright, needing none of the vectors above. |
 | 61 | Embedding cache artifacts | **out of scope** | Same access class as 60. |
 | 62 | Browser / client exposure | **out of scope** | Client-side rendering and storage. |
 | 63 | Observability-stack exposure | **out of scope** | Grafana/Loki/Alloy configuration under `observability/`. |

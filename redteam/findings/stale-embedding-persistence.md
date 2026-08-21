@@ -110,10 +110,11 @@ after the fix rather than just exiting 1.
 - **Ordering.** A retraction is only as timely as the next ingest run. Between
   the source edit and the sweep, the old text still answers. Nothing here makes
   deletion synchronous with the upstream change.
-- **The bytes on disk.** `delete_source` removes the row; `data/chroma_db/`
-  still holds every tier's text in the clear and SQLite does not zero freed
-  pages. A filesystem attacker recovers redacted content from the file
-  regardless — see [`vectorstore-no-access-control.md`](vectorstore-no-access-control.md).
+- **The bytes on disk.** `delete_source` removes the row, but SQLite does not zero
+  freed pages. Since `app/crypto.py` those pages hold ciphertext rather than
+  sentences, so what a filesystem attacker recovers from a retracted document is
+  its source path and tier, not its text. An attacker who can run as the app user
+  holds the key and recovers the text too — see [`vectorstore-no-access-control.md`](vectorstore-no-access-control.md).
 - **Embedding inversion.** Even a correctly retracted corpus leaves vectors for
   everything still indexed, and embeddings are partially invertible back to
   their source text. Same root exposure as the point above: the store is

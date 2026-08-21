@@ -121,8 +121,9 @@ In insecure mode that event never fires (screening is skipped), so the signal is
 its absence combined with `query.answered` carrying `mode: "insecure"` — every
 answered query in that mode passed its chunks to the model unscreened. A
 retrospective scan is also possible: run `prompt_filter.screen_chunk` over the
-indexed corpus (the text is in `data/chroma_db/` in the clear) and any chunk that
-matches is one that would reach a model unfiltered while insecure.
+indexed corpus — read it back through `vectorstore`, which decrypts the bodies,
+since `app/crypto.py` they are no longer readable straight off disk — and any
+chunk that matches is one that would reach a model unfiltered while insecure.
 
 ## Mitigation
 

@@ -283,16 +283,46 @@ review gate both rest on.
 
 ## Phase 3
 
-Set `SECURITY_FILTERS_ENABLED=true`, re-run the identical attack suite, record
-before/after in each finding. The gated defenses are deliberately imperfect: the
-prompt filter is regex and falls to homoglyphs, encoding, or an instruction
-split across chunks; `data/chroma_db/` stores every tier in the clear so
-filesystem access bypasses auth entirely; and a 12B local model follows a system
-prompt loosely. Report what still fails — do not claim the attacks are solved.
+`SECURITY_FILTERS_ENABLED=true`, the identical attack suite re-run unchanged,
+before/after recorded in each finding. Runs were captured on the defaults —
+`LLM_PROVIDER=ollama`, `OLLAMA_MODEL=llama3.2:3b`, `AGENTIC_RAG=false` — because
+phase 2 was captured there too; a run on a hosted 70B or on the agentic path is
+measuring a different system, not a secured one.
 
-Run it on the defaults: `LLM_PROVIDER=ollama`, `AGENTIC_RAG=false`. Phase 2 was
-captured against the local model and the fixed pipeline, so a phase 3 run on a
-hosted 70B or on the agentic path is measuring a different system.
+**The flag was the fix less than a third of the time.** That is the result worth
+recording. Four findings closed because the gated defense was turned on. Six
+needed a structural change the flag had nothing to do with. Three of those are
+unconditional, because they are defects rather than defenses and there is nothing
+to demonstrate by leaving them switched on: blocking the event loop, letting a
+redacted document keep answering, and shipping unpinned dependencies against an
+unverified model artifact. Four findings remain partially open.
 
-The defense code is gated, not absent. Do not delete it, and do not enable it by
-default before phase 3, or the two runs stop being comparable.
+What still fails, measured rather than predicted:
+
+- **Injection screening is regex.** It drops the chunk that carries a `SYSTEM:`
+  marker. It does not drop a plain false sentence, and a poisoned document
+  asserting the wrong refund window matches none of its seven rules — that is
+  why corpus poisoning needed a review gate instead.
+- **Prompt disclosure dilutes.** Prompts now register themselves and detection is
+  8-gram overlap, but interleaving legitimate sentences with disclosure still
+  serves at 3/3 and 5/2. Each round of tightening buys a ratio, not the class.
+- **The store is encrypted, and that is not the same as closed.** Document bodies
+  and free-text metadata are ciphertext at rest, so a copied directory no longer
+  yields sentences. The keys retrieval filters on stay readable because Chroma
+  cannot match what it cannot read, embeddings stay readable because similarity
+  search needs them and are partially invertible, and the app must hold the key
+  to answer at all. An encrypted volume is the strictly stronger control.
+- **The egress filter is a backstop.** It folds reframed *registered* secrets —
+  spacing, per-line, NATO, homoglyphs, base64, rot13, reversal — back to a
+  canonical core. A cipher agreed inside the prompt still passes, and no finite
+  rule set fixes that. The boundaries that held this pass were retrieval-time
+  clearance scoping, grounding, disjoint duties, and the review gate.
+- **A 3B local model follows a system prompt loosely**, and is not usable as a
+  second-layer judge: measured against a document containing all four legitimate
+  sentences verbatim, it flagged 1 of 4 disclosure fragments while false-flagging
+  2 of 4 grounded sentences in the clean control.
+
+The defense code stays gated and the default stays `false`. Deleting it, or
+flipping the default, is what would stop the two runs being comparable — and the
+phase-2 configuration has to remain reproducible for any of the before/after
+numbers in `redteam/findings/` to be checkable.

@@ -156,7 +156,7 @@ Generation and embedding both run locally by default — no model API key, no
 document text leaves the machine.
 
 ```sh
-ollama pull gemma4:12b          # or set OLLAMA_MODEL to one you already have
+ollama pull llama3.2:3b         # or set OLLAMA_MODEL to one you already have
 python -m venv .venv && source .venv/bin/activate
 pip install --require-hashes -r requirements.lock   # pinned + hash-verified
 cp .env.example .env            # set SESSION_SIGNING_KEY, DEMO_USERS, GRAFANA_ADMIN_PASSWORD

@@ -9,7 +9,7 @@ is an injection vector into the model's context.
 ## Stack
 
 Generation goes through a LangChain chat model selected by `LLM_PROVIDER`.
-Default is `ollama` — a local daemon (`gemma4:12b`, set via `OLLAMA_MODEL`) with
+Default is `ollama` — a local daemon (`llama3.2:3b`, set via `OLLAMA_MODEL`) with
 no API key, so nothing leaves the machine. `groq` is an opt-in alternative using
 Groq's free hosted tier (`GROQ_MODEL`, `GROQ_API_KEY`); it is faster but sends
 questions and retrieved chunks to a third party, which voids the offline
@@ -63,6 +63,6 @@ do not enable it by default before phase 3.
 The gated defenses are also imperfect, which matters for phase 3: the prompt
 filter is regex and beatable by homoglyphs, encoding, or an instruction split
 across chunks; `data/chroma_db/` stores every tier's text in the clear, so
-filesystem access bypasses auth entirely; and a 12B local model follows a system
+filesystem access bypasses auth entirely; and a 3B local model follows a system
 prompt loosely. Phase 3 should report what still fails with filters on, not
 claim the attacks are solved.

@@ -79,7 +79,7 @@ from app.secrets import agentic_enabled, filters_enabled, optional, require
 PROVIDER = optional("LLM_PROVIDER", "ollama").strip().lower()
 
 OLLAMA_HOST = optional("OLLAMA_HOST", "http://localhost:11434")
-OLLAMA_MODEL = optional("OLLAMA_MODEL", "gemma4:12b")
+OLLAMA_MODEL = optional("OLLAMA_MODEL", "llama3.2:3b")
 GROQ_MODEL = optional("GROQ_MODEL", "llama-3.3-70b-versatile")
 
 # What the audit log and error messages call the active model.

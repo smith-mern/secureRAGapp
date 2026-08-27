@@ -16,8 +16,8 @@ sources = sorted({hit["metadata"].get("source", "unknown") for hit in grounded})
 return {"answer": safe_text, "sources": [] if blocked else sources, ...}
 ```
 
-The system prompt tells the *model* not to mention filenames in its prose, and a
-12B model mostly complies — so the visible answer often names nothing. But
+The system prompt tells the *model* not to mention filenames in its prose, and
+`llama3.2:3b` mostly complies — so the visible answer often names nothing. But
 `sources` is structured data built separately from the model output and returned
 unconditionally whenever the response is not blocked. Two consequences:
 

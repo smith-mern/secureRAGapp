@@ -39,6 +39,7 @@ os.environ.setdefault("AUDIT_LOG_PATH", tempfile.mktemp(prefix="securerag-attack
 sys.path.insert(0, str(Path(__file__).resolve().parents[2]))
 
 from app import ingest, vectorstore  # noqa: E402
+from app.connectors import tickets  # noqa: E402
 
 # Isolated store. Must be set before the first collection is created.
 vectorstore.CHROMA_DIR = Path(tempfile.mkdtemp(prefix="securerag-attack-chroma-"))
@@ -63,11 +64,17 @@ MAX_DISTANCE = float(os.environ.get("MAX_DISTANCE", "0.75"))
 
 
 def _upsert_only(source: str, text: str, metadata: dict) -> int:
-    """What `ingest._index` did before this finding: write, never retract."""
+    """What `ingest._index` did before this finding: write, never retract.
+
+    Carries `content_hash` because approval is bound to it — that binding is a
+    different control and reproducing this bug must not depend on its absence.
+    What stays faithful to the old path is the missing delete, which is the bug.
+    """
+    stamped = {**metadata, "source": source, "content_hash": tickets.content_hash(text)}
     return vectorstore.add_chunks(
         TIER,
         (
-            (vectorstore.chunk_id(source, i), chunk, {**metadata, "source": source})
+            (vectorstore.chunk_id(source, i), chunk, stamped)
             for i, chunk in enumerate(ingest.chunk_text(text))
         ),
     )
@@ -96,7 +103,12 @@ def main() -> int:
 
     print("[*] indexing ticket 42 (with payment details), then approving it")
     _upsert_only(SOURCE, V1, metadata)
-    approved = vectorstore.mark_reviewed(TIER, SOURCE, reviewer="erin")
+    # mark_reviewed binds approval to the indexed revision, so the script reads
+    # it back the way an approver's client does.
+    approved = vectorstore.mark_reviewed(
+        TIER, SOURCE, reviewer="erin",
+        expected_hash=vectorstore.source_revision(TIER, SOURCE),
+    )
     print(f"[*] approver signed off {approved} chunk(s) -> reviewed=True")
 
     print("[*] support redacts the payment details; the record re-syncs")
@@ -122,7 +134,10 @@ def main() -> int:
     print("\n[*] same sequence through the fixed ingest._index (delete, then write)")
     vectorstore.delete_source(TIER, SOURCE)
     ingest._index(TIER, SOURCE, V1, metadata)
-    vectorstore.mark_reviewed(TIER, SOURCE, reviewer="erin")
+    vectorstore.mark_reviewed(
+        TIER, SOURCE, reviewer="erin",
+        expected_hash=vectorstore.source_revision(TIER, SOURCE),
+    )
     ingest._index(TIER, SOURCE, V2, metadata)
     if _report("fixed write path"):
         print("[!] REGRESSION — redacted text is still retrievable after the fix")

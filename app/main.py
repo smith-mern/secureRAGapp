@@ -22,11 +22,11 @@ from contextlib import asynccontextmanager
 
 from pathlib import Path
 
-from fastapi import Depends, FastAPI, HTTPException, Request, Response, status
+from fastapi import Depends, FastAPI, HTTPException, Query, Request, Response, status
 from fastapi.responses import FileResponse, JSONResponse
 from pydantic import BaseModel
 
-from app import audit_log, ingest, limits, rag_chain, secrets, vectorstore
+from app import audit_log, ingest, limits, rag_chain, review_agent, secrets, vectorstore
 from app import chat as chat_store
 
 STATIC_DIR = Path(__file__).resolve().parent / "static"
@@ -194,9 +194,22 @@ class ChatRequest(BaseModel):
     session_id: str | None = None
 
 
+class RejectRequest(BaseModel):
+    tier: str
+    source: str
+    content_hash: str
+    # Free text for the audit trail and for whoever has to fix the document. Not
+    # echoed back to the uploader by any endpoint here — /upload has no channel
+    # for it — so it is a record, not a message.
+    reason: str = ""
+
+
 class ReviewRequest(BaseModel):
     tier: str
     source: str
+    # Required, not optional. An approval that may omit the revision is an
+    # approval an attacker omits it from, and the whole binding is gone.
+    content_hash: str
 
 
 class UploadRequest(BaseModel):
@@ -299,6 +312,151 @@ def run_ingest(
     return {"indexed": ingest.ingest_all(actor=user.username), "totals": vectorstore.stats()}
 
 
+@app.get("/review")
+def review_queue(
+    limit: int = Query(default=50, ge=1, le=200),
+    offset: int = Query(default=0, ge=0),
+    user: User = Depends(require_role("approver")),
+    _: None = Depends(limits.rate_limit("review")),
+) -> dict[str, object]:
+    """Everything awaiting approval, worst first. `approver` only.
+
+    /review has always taken an exact `source` string, which assumed an approver
+    already knew what was pending — there was no way to enumerate it. A gate
+    whose queue cannot be read is a gate that gets bypassed by neglect, and
+    unreviewed uploads pile up until someone approves a batch unread.
+
+    Risk is read from metadata written at index time, not recomputed per request.
+    Rescanning here made the listing cost scale with how much was waiting, which
+    an uploader controls: the 50 KB cap bounds one document, not how many get
+    submitted. Paginated for the same reason — an unbounded response is the other
+    half of that lever.
+
+    Scanning at ingest never gates ingestion: a document is stored and indexed
+    `reviewed=false` whatever the scan says, and a scan that failed shows as
+    `unknown` risk here rather than as clean. Bodies are not returned — this
+    lists what is waiting, and reading the content is GET /review/document.
+    """
+    pending: list[dict[str, object]] = []
+    for tier in allowed_tiers(user.clearance):
+        pending.extend(vectorstore.pending_review(tier))
+
+    # Riskiest first: a queue sorted by arrival buries the one document that
+    # needed a human under fifty that did not. `unknown` outranks `low` — a
+    # document whose scan did not complete is not a document known to be fine.
+    order = {"high": 0, "unknown": 1, "missing": 1, "medium": 2, "low": 3}
+    pending.sort(key=lambda item: (order.get(str(item["risk"]), 1), str(item["source"])))
+
+    total = len(pending)
+    page = pending[offset : offset + limit]
+    audit_log.log(
+        "review.queue", actor=user.username, decision="allow",
+        pending=total, returned=len(page),
+    )
+    return {"pending": page, "count": len(page), "total": total,
+            "offset": offset, "limit": limit}
+
+
+@app.get("/review/document")
+def review_document(
+    tier: str,
+    source: str,
+    user: User = Depends(require_role("approver")),
+    _: None = Depends(limits.rate_limit("review")),
+) -> dict[str, object]:
+    """One pending document with its advisory scan. `approver` only.
+
+    This is the only endpoint that returns unreviewed text, and it is bounded by
+    the approver's clearance like every other read. That is the trade the review
+    gate requires: somebody has to read the thing to approve it. The scan's job
+    is to make that reading tractable by naming the lines worth looking at.
+    """
+    tier = validate_tier(tier, allowed_tiers(user.clearance))
+    text = vectorstore.source_text(tier, source)
+    if not text:
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such source")
+
+    revision = vectorstore.source_revision(tier, source)
+    report = review_agent.review(text, source)
+    audit_log.log(
+        "review.scan", actor=user.username, decision="allow", tier=tier, source=source,
+        risk=report["risk"], rules=[f["rule"] for f in report["findings"]],
+        classifier=report["classifier"]["verdict"], revision=revision,
+    )
+    # `content_hash` is what POST /review must echo back. It identifies the bytes
+    # rendered above, so approving a document that was replaced in the meantime
+    # fails with 409 instead of signing off on text nobody read.
+    return {"tier": tier, "text": text, "report": report, "content_hash": revision}
+
+
+@app.post("/review/reject")
+def review_reject(
+    body: RejectRequest,
+    user: User = Depends(require_role("approver")),
+    _: None = Depends(limits.rate_limit("review")),
+) -> dict[str, object]:
+    """Reject a pending document and take it out of circulation. `approver` only.
+
+    Approval is all-or-nothing: it trusts the document as written, flagged
+    passages included. There is deliberately no partial approval and no
+    sanitizer — an approver who removes the one line a scan flagged is editing
+    an attacker's document into a shape that passes the scan, and the
+    split-instruction case means "the flagged line" and "the instruction" are
+    not reliably the same thing. So the two outcomes are: approve this exact
+    revision, or reject it and ask for a clean replacement.
+
+    Leaving it pending is not the third option it looks like. A pending document
+    stays in the queue forever, so a stream of bad uploads becomes the queue
+    padding the size cap exists to prevent — the reject path is what keeps the
+    queue drainable.
+
+    Rejection drops the chunks and moves the file out of `data/uploads/`, since
+    `ingest_uploads` re-sweeps that directory and would otherwise reinstate the
+    document on the next `POST /ingest`. The file is moved to `data/quarantine/`
+    rather than deleted: it is evidence.
+
+    A `connector:*` record has no file here. Its chunks are dropped, but the
+    upstream system owns the record and the next sync reinstates it unless it is
+    fixed there. `requeued` in the response says which case happened rather than
+    reporting a durable rejection this application cannot make.
+    """
+    tier = validate_tier(body.tier, allowed_tiers(user.clearance))
+    try:
+        chunks = vectorstore.reject_source(tier, body.source, body.content_hash)
+    except vectorstore.StaleRevision:
+        # The uploader may have replaced a flagged document with a corrected one
+        # while it sat in the queue. Rejecting the version that was read must not
+        # destroy the version that was not.
+        audit_log.log(
+            "review.reject", actor=user.username, decision="deny",
+            tier=tier, source=body.source, reason="stale_revision",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document changed since it was read; review it again",
+        )
+
+    if not chunks:
+        audit_log.log(
+            "review.reject", actor=user.username, decision="deny",
+            tier=tier, source=body.source, reason="unknown_source",
+        )
+        raise HTTPException(status_code=status.HTTP_404_NOT_FOUND, detail="No such source")
+
+    quarantined = ingest.quarantine_upload(tier, body.source, user.username)
+    audit_log.log(
+        "review.reject", actor=user.username, decision="allow",
+        tier=tier, source=body.source, chunks=chunks, revision=body.content_hash,
+        quarantined=quarantined, note=body.reason[:200],
+    )
+    return {
+        "source": body.source, "tier": tier, "chunks": chunks, "rejected": True,
+        "quarantined": quarantined,
+        # True where this app cannot make the rejection stick on its own.
+        "requeued_on_next_sync": not quarantined,
+    }
+
+
 @app.post("/review")
 def review(
     body: ReviewRequest,
@@ -314,7 +472,23 @@ def review(
     clearance so an approver cannot reach into a tier they may not read.
     """
     tier = validate_tier(body.tier, allowed_tiers(user.clearance))
-    chunks = vectorstore.mark_reviewed(tier, body.source, user.username)
+    try:
+        chunks = vectorstore.mark_reviewed(
+            tier, body.source, user.username, body.content_hash
+        )
+    except vectorstore.StaleRevision:
+        # 409, not a silent re-approval: the document under this name is not the
+        # one that was read. Deliberately does not say what changed — the
+        # approver re-reads it, which is the only thing that restores the
+        # property this check exists to protect.
+        audit_log.log(
+            "review.approve", actor=user.username, decision="deny",
+            tier=tier, source=body.source, reason="stale_revision",
+        )
+        raise HTTPException(
+            status_code=status.HTTP_409_CONFLICT,
+            detail="Document changed since it was read; review it again",
+        )
     if not chunks:
         # 404 rather than a cheerful no-op: "approved" for a source that does not
         # exist is a lie an operator would act on.
@@ -326,9 +500,12 @@ def review(
 
     audit_log.log(
         "review.approve", actor=user.username, decision="allow",
-        tier=tier, source=body.source, chunks=chunks,
+        tier=tier, source=body.source, chunks=chunks, revision=body.content_hash,
     )
-    return {"source": body.source, "tier": tier, "chunks": chunks, "reviewed": True}
+    return {
+        "source": body.source, "tier": tier, "chunks": chunks,
+        "reviewed": True, "content_hash": body.content_hash,
+    }
 
 
 def _without_filter_telemetry(result: dict[str, object]) -> dict[str, object]:

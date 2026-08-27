@@ -13,6 +13,10 @@ data/chroma_db/
 # carry any tier — never commit.
 data/uploads/
 
+# Uploads an approver rejected, moved here so ingest stops sweeping them. Same
+# content as data/uploads/ and by definition the malicious end of it.
+data/quarantine/
+
 # observability runtime state
 observability/data/
 

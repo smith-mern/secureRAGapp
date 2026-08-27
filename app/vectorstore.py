@@ -267,6 +267,9 @@ CURATED_ORIGIN = "curated"
 _CLEARTEXT_METADATA_KEYS = frozenset({
     "source", "tier", "origin", "reviewed", "reviewed_by",
     "uploaded_by", "content_hash", "updated_at",
+    # Advisory scan results. Rule names and a risk level, never excerpts — the
+    # queue reads these without decrypting, and nothing here is document text.
+    "scan_status", "scan_risk", "scan_rules", "reviewed_hash",
 })
 
 # Records which crypto version sealed a record, in the clear alongside the other
@@ -451,15 +454,37 @@ def embed(texts: list[str]) -> list[list[float]]:
         return [[float(value) for value in vector] for vector in _embedder(texts)]
 
 
-def mark_reviewed(tier: str, source: str, reviewer: str) -> int:
+class StaleRevision(Exception):
+    """Approval named a version of the document that is no longer indexed."""
+
+    def __init__(self, expected: str, actual: str) -> None:
+        super().__init__("document changed since it was read")
+        self.expected = expected
+        self.actual = actual
+
+
+def mark_reviewed(tier: str, source: str, reviewer: str, expected_hash: str) -> int:
     """Flip every chunk of `source` to reviewed. Returns how many changed.
 
     Review is recorded on the chunks rather than in a side table because
     retrieval reads chunks and nothing else — a trust decision kept anywhere the
     retrieval path does not look is a trust decision that does not apply.
 
+    `expected_hash` binds the approval to the bytes the approver actually read.
+    Without it this was a time-of-check/time-of-use hole with a human in the
+    middle: an approver fetches `tier`+`source`, reads it, and approves
+    `tier`+`source` — but `_index` replaces a document in place under the same
+    source name, so an uploader who re-uploads between those two requests gets
+    the *replacement* approved. The approver's judgement is then attached to
+    content nobody looked at, which is worse than having no review at all,
+    because the audit log records a human sign-off either way.
+
+    Both the check and the write happen under `_CLIENT_LOCK`, so the comparison
+    cannot be raced by the very upload it exists to catch.
+
     Returns 0 for an unknown source, which the caller reports as a 404 rather
-    than pretending to have approved something.
+    than pretending to have approved something. Raises `StaleRevision` if the
+    indexed content has moved on, which the caller reports as 409.
     """
     with _CLIENT_LOCK:
         collection = _collection(tier)
@@ -467,10 +492,25 @@ def mark_reviewed(tier: str, source: str, reviewer: str) -> int:
         ids = found["ids"]
         if not ids:
             return 0
+
+        # Every chunk of one source is written by a single _index call, so the
+        # hashes agree; disagreement means a partial write and is not approvable.
+        hashes = {str(metadata.get("content_hash", "")) for metadata in found["metadatas"]}
+        actual = hashes.pop() if len(hashes) == 1 else ""
+        if not actual or actual != expected_hash:
+            raise StaleRevision(expected=expected_hash, actual=actual)
+
         collection.update(
             ids=ids,
             metadatas=[
-                {**metadata, "reviewed": True, "reviewed_by": reviewer}
+                {
+                    **metadata,
+                    "reviewed": True,
+                    "reviewed_by": reviewer,
+                    # Records which revision was signed off, so the log answers
+                    # "what did they approve" and not merely "that they did".
+                    "reviewed_hash": actual,
+                }
                 for metadata in found["metadatas"]
             ],
         )
@@ -584,3 +624,118 @@ def stats() -> dict[str, int]:
     """Chunk count per tier. Metadata only — safe to expose to an admin."""
     with _CLIENT_LOCK:
         return {tier: _collection(tier).count() for tier in ("public", "internal", "restricted")}
+
+
+def pending_review(tier: str) -> list[dict[str, Any]]:
+    """Every unreviewed source in `tier`, one entry per source.
+
+    Without this an `approver` has to already know the exact source string to
+    call /review with, which means the control that gates the whole untrusted
+    write path has no way to enumerate what is waiting on it. A queue nobody can
+    read is a queue nobody works.
+
+    Returns metadata and chunk counts only — never chunk text. The point of the
+    review gate is that this content has not been cleared yet, so listing it must
+    not become a way to read it. Fetching the body is a separate, deliberate call
+    (`source_text`).
+
+    Risk comes from `scan_*`, written at index time by `ingest._scan_metadata`.
+    Reading it back rather than rescanning is what keeps this call from doing
+    work an uploader chooses the size of: no decryption, no reassembly, no regex
+    over the corpus. A record indexed before scanning existed carries no
+    `scan_status`, and reports `unknown` rather than being quietly treated as
+    clean.
+    """
+    with _CLIENT_LOCK:
+        found = _collection(tier).get(where={"reviewed": False}, include=["metadatas"])
+
+    # No _unseal_metadata: every key read below is in _CLEARTEXT_METADATA_KEYS,
+    # so decrypting the record would only spend crypto on fields nobody reads.
+    sources: dict[str, dict[str, Any]] = {}
+    for clear in found["metadatas"]:
+        source = clear.get("source", "")
+        entry = sources.setdefault(
+            source,
+            {
+                "source": source,
+                "tier": tier,
+                "origin": clear.get("origin", ""),
+                "uploaded_by": clear.get("uploaded_by", ""),
+                "content_hash": clear.get("content_hash", ""),
+                "scan_status": clear.get("scan_status", "missing"),
+                "risk": clear.get("scan_risk", "unknown"),
+                "rules": [rule for rule in str(clear.get("scan_rules", "")).split(",") if rule],
+                "chunks": 0,
+            },
+        )
+        entry["chunks"] += 1
+    return sorted(sources.values(), key=lambda entry: entry["source"])
+
+
+def source_text(tier: str, source: str) -> str:
+    """Reassemble one source's text from its chunks, in chunk order.
+
+    For the review path: an approver deciding whether to trust a document has to
+    be able to read it. Chunks overlap by CHUNK_OVERLAP characters, so this is
+    the indexed text with seams, not a byte-exact copy of the upload — good
+    enough to review, and it comes from the index rather than the filesystem so
+    what is read is what would actually answer.
+    """
+    with _CLIENT_LOCK:
+        found = _collection(tier).get(
+            where={"source": source}, include=["documents", "metadatas"]
+        )
+    if not found["ids"]:
+        return ""
+
+    # Chunk ids are sha256 hashes, so sorting them gives hash order, not document
+    # order — a reviewer would read the paragraphs shuffled, which is exactly how
+    # a planted instruction goes unnoticed. chunk_id is deterministic, so rebuild
+    # the mapping instead of storing an index and needing a re-ingest for it.
+    position = {chunk_id(source, i): i for i in range(len(found["ids"]))}
+    ordered = sorted(
+        zip(found["ids"], found["documents"], found["metadatas"]),
+        key=lambda row: position.get(row[0], len(position)),
+    )
+    return "\n".join(_unseal_document(doc, meta) for _, doc, meta in ordered)
+
+
+def source_revision(tier: str, source: str) -> str:
+    """The content hash currently indexed for `source`, or "" if unknown.
+
+    One read, so the value handed to an approver and the value checked at
+    approval come from the same field. Chunks of a source disagreeing means a
+    partially rewritten document, which reports "" and is therefore not
+    approvable — `mark_reviewed` refuses an empty expected hash.
+    """
+    with _CLIENT_LOCK:
+        found = _collection(tier).get(where={"source": source}, include=["metadatas"])
+    hashes = {str(metadata.get("content_hash", "")) for metadata in found["metadatas"]}
+    return hashes.pop() if len(hashes) == 1 else ""
+
+
+def reject_source(tier: str, source: str, expected_hash: str) -> int:
+    """Drop every chunk of `source`, bound to the revision that was read.
+
+    The mirror of `mark_reviewed`, and hash-bound for the same reason in the
+    opposite direction: without the check, an uploader who replaces a flagged
+    document with a *corrected* one between the approver reading it and
+    rejecting it would have the correction destroyed. Rejection is as
+    destructive as approval is permissive, so both name the version they act on.
+
+    Returns 0 for an unknown source. Raises `StaleRevision` if the indexed
+    content has moved on.
+    """
+    with _CLIENT_LOCK:
+        collection = _collection(tier)
+        found = collection.get(where={"source": source}, include=["metadatas"])
+        if not found["ids"]:
+            return 0
+
+        hashes = {str(metadata.get("content_hash", "")) for metadata in found["metadatas"]}
+        actual = hashes.pop() if len(hashes) == 1 else ""
+        if not actual or actual != expected_hash:
+            raise StaleRevision(expected=expected_hash, actual=actual)
+
+        collection.delete(ids=found["ids"])
+    return len(found["ids"])

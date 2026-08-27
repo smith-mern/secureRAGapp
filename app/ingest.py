@@ -43,10 +43,18 @@ from app.filters.input_validation import (
     validate_filename,
     validate_tier,
 )
-from app.secrets import DOCUMENTS_DIR, UPLOADS_DIR, optional
+from app.secrets import DOCUMENTS_DIR, QUARANTINE_DIR, UPLOADS_DIR, optional
 
 ALLOWED_SUFFIXES = {".txt", ".md"}
 MAX_FILE_BYTES = 2 * 1024 * 1024
+# Uploads are capped far below MAX_FILE_BYTES because they are the only content
+# a human has to approve before it can answer anyone. 2 MB of markdown is ~350k
+# words — nobody reviews that, so an `approver` faced with it either rubber-
+# stamps or stalls, and an uploader who knows that pads the document and buries
+# the payload. Curated content keeps the larger cap: it is trusted by host
+# filesystem access and never reaches the review queue.
+# ponytail: one constant; raise it only alongside a way to review what it admits.
+MAX_UPLOAD_BYTES = int(optional("MAX_UPLOAD_BYTES", str(50 * 1024)))
 
 CHUNK_CHARS = int(optional("CHUNK_CHARS", "1000"))
 CHUNK_OVERLAP = int(optional("CHUNK_OVERLAP", "150"))
@@ -82,13 +90,68 @@ def _index(tier: str, source: str, text: str, metadata: dict) -> int:
     """
     vectorstore.delete_source(tier, source)
     chunks = chunk_text(text)
+
+    # Hash what is actually being indexed, not what a caller says it indexed.
+    # This is the revision an approver's decision is bound to: /review requires
+    # it, so approving a document that was replaced between reading and signing
+    # off fails closed instead of blessing the replacement.
+    #
+    # Computed here rather than accepted from `metadata` so there is one
+    # definition of "the version of this document". The connector supplies its
+    # own for change detection; it hashes the same text, and letting this one win
+    # keeps the two from ever disagreeing about what is stored.
+    stamped = {
+        **metadata,
+        "source": source,
+        "content_hash": tickets.content_hash(text),
+        **_scan_metadata(text, source),
+    }
+
     return vectorstore.add_chunks(
         tier,
         (
-            (vectorstore.chunk_id(source, i), chunk, {**metadata, "source": source})
+            (vectorstore.chunk_id(source, i), chunk, stamped)
             for i, chunk in enumerate(chunks)
         ),
     )
+
+
+def _scan_metadata(text: str, source: str) -> dict[str, object]:
+    """Deterministic review findings, recorded at index time.
+
+    The review queue used to scan every pending document on every request:
+    decrypt, reassemble, normalize, regex. That is work an uploader controls the
+    volume of — the 50 KB cap bounds one document, not how many they submit — so
+    the listing got more expensive the more there was waiting on it, which is the
+    wrong direction for a queue under load.
+
+    Scanning here does not gate ingestion. The document is stored and indexed
+    either way, still `reviewed=False`; this only records what the scan saw so
+    the queue can read it instead of recomputing it. A scanner failure is
+    recorded as `scan_status="unavailable"` and surfaces as unknown risk in the
+    queue — never as clean.
+    """
+    from app import review_agent
+
+    try:
+        findings = review_agent.inspect(text, source)
+    except Exception as exc:  # noqa: BLE001 - never let advisory work fail an ingest
+        audit_log.log(
+            "review.scan", decision="error", source=source, reason=type(exc).__name__
+        )
+        return {"scan_status": "unavailable", "scan_risk": "unknown", "scan_rules": ""}
+
+    severities = {finding["severity"] for finding in findings}
+    risk = "high" if "high" in severities else "medium" if "medium" in severities else "low"
+    # Chroma metadata values are scalars, so the rule names travel as one field.
+    # Names only — never excerpts, which would put attacker text into a second
+    # store that a different reader decrypts.
+    rules = sorted({str(finding["rule"]) for finding in findings})
+    return {
+        "scan_status": "complete",
+        "scan_risk": risk,
+        "scan_rules": ",".join(rules),
+    }
 
 
 # --------------------------------------------------------------------------
@@ -231,8 +294,8 @@ def store_upload(
     if not isinstance(content, str) or not content.strip():
         raise ValidationError("document is empty")
     encoded = content.encode("utf-8")
-    if len(encoded) > MAX_FILE_BYTES:
-        raise ValidationError(f"document must be at most {MAX_FILE_BYTES} bytes")
+    if len(encoded) > MAX_UPLOAD_BYTES:
+        raise ValidationError(f"document must be at most {MAX_UPLOAD_BYTES} bytes")
 
     root = UPLOADS_DIR.resolve()
     tier_dir = root / tier
@@ -361,3 +424,51 @@ def ingest_all(actor: str = "system") -> dict[str, dict[str, int]]:
     except tickets.SourceUnavailable:
         connector = {"error": "source_unavailable"}
     return {"curated": curated, "uploads": uploads, "connector": connector}
+
+
+def quarantine_upload(tier: str, source: str, actor: str) -> bool:
+    """Move a rejected upload out of the ingest sweep. Returns whether a file moved.
+
+    `ingest_uploads` re-reads `UPLOADS_DIR` from disk on every run, so dropping a
+    document's chunks is not a rejection — the next `POST /ingest`, which any
+    `uploader` can call, puts it straight back. The file has to leave the swept
+    directory or the rejection undoes itself.
+
+    Only uploads have a file to move. A `connector:*` record is owned upstream:
+    this application can drop it from the index, but the next sync reinstates it
+    unless it is fixed at the source. That limit is real and is stated in the
+    endpoint rather than papered over with a rejection ledger nothing else reads.
+    """
+    prefix = f"{UPLOAD_ORIGIN}/"
+    if not source.startswith(prefix):
+        return False
+
+    root = UPLOADS_DIR.resolve()
+    try:
+        # Same two-gate treatment as ingestion: the source string reached us over
+        # the network, and it is about to be turned into a path.
+        origin_path = safe_document_path(root, root / source[len(prefix) :])
+    except ValidationError:
+        audit_log.log(
+            "review.quarantine", actor=actor, decision="deny",
+            source=source, reason="path_escape",
+        )
+        return False
+
+    if not origin_path.is_file():
+        return False
+
+    destination = QUARANTINE_DIR / tier / origin_path.name
+    destination.parent.mkdir(parents=True, exist_ok=True)
+    # Suffix on collision rather than overwrite: two rejected uploads sharing a
+    # filename are two pieces of evidence, and the second must not erase the first.
+    if destination.exists():
+        stamp = vectorstore.chunk_id(source, int(destination.stat().st_mtime))[:8]
+        destination = destination.with_name(f"{destination.stem}.{stamp}{destination.suffix}")
+
+    origin_path.replace(destination)
+    audit_log.log(
+        "review.quarantine", actor=actor, decision="allow",
+        tier=tier, source=source, moved_to=str(destination.relative_to(QUARANTINE_DIR.parent)),
+    )
+    return True

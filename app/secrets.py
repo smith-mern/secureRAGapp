@@ -28,6 +28,13 @@ DOCUMENTS_DIR = _REPO_ROOT / "data" / "documents"
 # roots separately is what lets a chunk keep origin="upload" instead of being
 # re-indexed as curated content on the next rebuild.
 UPLOADS_DIR = _REPO_ROOT / "data" / "uploads"
+# Rejected uploads are moved here rather than deleted. Outside UPLOADS_DIR so
+# `ingest_uploads` stops seeing them — it re-sweeps that directory from disk, so
+# a rejection that only dropped the chunks would be undone by the next
+# `POST /ingest`, which any `uploader` can call. Moved rather than unlinked
+# because the document is evidence: a red-team writeup needs the artifact, and
+# "we deleted it" is a worse answer than "it is here, out of the index".
+QUARANTINE_DIR = _REPO_ROOT / "data" / "quarantine"
 CHROMA_DIR = _REPO_ROOT / "data" / "chroma_db"
 AUDIT_LOG_PATH = Path(os.environ.get("AUDIT_LOG_PATH") or _REPO_ROOT / "audit.log")
 

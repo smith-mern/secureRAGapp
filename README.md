@@ -183,6 +183,9 @@ distribution file PyPI serves for that version. Install from the lock —
 a substituted package into a failed build instead of code executing at install
 time on the machine that holds every tier's document text.
 
+The resolved closure, both models, and the optional native tools are inventoried as a
+CycloneDX SBOM in [`sbom/`](sbom/README.md); regenerate it whenever the lock changes.
+
 Regenerate after changing `requirements.txt`, and commit the diff so a
 resolution change is reviewable rather than silent:
 

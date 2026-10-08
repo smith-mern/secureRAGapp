@@ -30,6 +30,24 @@ CycloneDX 1.6 JSON. It is generated, not hand-edited.
   package declares them.
 - Ollama, the system Python, and the OS are not inventoried.
 
+## Vulnerability status
+
+Last scanned 2026-10-08 with `pip-audit -r requirements.lock --require-hashes --disable-pip`.
+
+**Open:** four advisories in `chromadb 1.5.9`, with no fixed release yet:
+
+- CVE-2026-45829 and CVE-2026-45833: code execution through `trust_remote_code`.
+- CVE-2026-45830 and CVE-2026-45831: authorization and tenant-isolation bypass.
+
+All four are in Chroma's HTTP server (the `/api/v2` endpoints and
+`SimpleRBACAuthorizationProvider`). This app runs Chroma in-process through
+`chromadb.PersistentClient` (`app/vectorstore.py`) and exposes neither, so the
+risk is accepted for now. That acceptance ends if Chroma ever runs as a server.
+Re-scan, and upgrade, when a fixed release ships.
+
+**Fixed in this lock:** urllib3 2.7.0 → 2.8.0 (3 advisories), multidict 6.7.1
+→ 6.9.1 (1), oauthlib 3.3.1 → 4.0.0 (1), and pip 25.1.1 → 26.2.1 (6).
+
 ## Regenerate
 
 Regenerate after any change to `requirements.lock`, and commit the diff:
